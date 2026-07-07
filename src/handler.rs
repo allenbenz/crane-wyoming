@@ -6,14 +6,14 @@
 //! [`ModelRuntime`], and writes `audio-start`/`audio-chunk`/`audio-stop`
 //! responses to an [`AsyncWrite`] sink.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use candle_core::DType;
 use crane::audio::tts::pcm_f32_to_i16;
 use crane_core::generation::SpeechOptions;
-use crane_engine::{ModelRuntime, TtsGenerateRequest};
+use crane_engine::{ModelRuntime, TtsGenerateRequest, TtsHandle};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::oneshot;
 
@@ -33,6 +33,10 @@ use crate::wire::{read_event, write_event};
 pub struct VoiceMap {
     /// voice name -> model registration name
     map: HashMap<String, String>,
+    /// Registration names of all configured models that were found in the
+    /// runtime (used to distinguish "no voices left after dedup" from
+    /// "not a configured model" in service discovery).
+    model_names: HashSet<String>,
     /// Name of the default model, used when a `synthesize` event specifies
     /// no voice.
     default_model: Option<String>,
@@ -47,10 +51,12 @@ impl VoiceMap {
     #[must_use]
     pub fn new(model_names: &[String], runtime: &ModelRuntime) -> Self {
         let mut map = HashMap::new();
+        let mut found_names = HashSet::new();
         for name in model_names {
             let Some(handle) = runtime.tts_handle(name) else {
                 continue;
             };
+            found_names.insert(name.clone());
             for voice in handle.voices() {
                 match map.entry(voice.name.clone()) {
                     Entry::Vacant(entry) => {
@@ -68,13 +74,23 @@ impl VoiceMap {
             }
         }
         let default_model = runtime.default_tts_name().map(String::from);
-        Self { map, default_model }
+        Self {
+            map,
+            model_names: found_names,
+            default_model,
+        }
     }
 
     /// Returns the model registration name for `voice_name`, if known.
     #[must_use]
     pub fn model_for_voice(&self, voice_name: &str) -> Option<&str> {
         self.map.get(voice_name).map(String::as_str)
+    }
+
+    /// Returns `true` if `name` is a configured model registration name.
+    #[must_use]
+    pub fn has_model(&self, name: &str) -> bool {
+        self.model_names.contains(name)
     }
 
     /// Returns the default model's registration name, if any TTS model is loaded.
@@ -125,7 +141,7 @@ fn resolve_voice<'m, 'd>(
 ///
 /// Reads events from `reader` and dispatches them: `synthesize` requests
 /// generate speech through `runtime`, `ping` is answered with `pong`,
-/// `describe` gets a (currently empty) `info` response, and unrecognized
+/// `describe` gets an `info` response with available TTS model metadata, and unrecognized
 /// event types get an `error` response. The loop continues until the
 /// client disconnects cleanly (EOF) or the wire protocol desyncs.
 ///
@@ -169,7 +185,7 @@ where
         match event {
             Event::Synthesize(data) => handle_synthesize(writer, runtime, voice_map, data).await?,
             Event::Ping(data) => handle_ping(writer, data).await?,
-            Event::Describe => handle_describe(writer).await?,
+            Event::Describe => handle_describe(writer, runtime, voice_map).await?,
             Event::Unknown { event_type, .. } => {
                 tracing::warn!(event_type = %event_type, "Unknown event type");
                 send_error(
@@ -306,13 +322,89 @@ where
 
 /// Answer a `describe` event with service discovery info.
 ///
-/// Currently a stub returning an empty [`InfoData`]; populated with real
-/// model/voice information in a later step.
-async fn handle_describe<W>(writer: &mut W) -> Result<()>
+/// Lists every TTS model registered in `runtime` as a `tts` program
+/// descriptor, including its voices. ASR and wake-word lists are always
+/// empty (Crane does not yet serve those over Wyoming).
+async fn handle_describe<W>(
+    writer: &mut W,
+    runtime: &ModelRuntime,
+    voice_map: &VoiceMap,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    write_event(writer, &Event::Info(InfoData::default())).await
+    write_event(writer, &Event::Info(build_info(runtime, voice_map))).await
+}
+
+/// Returns the Crane project attribution object used in Wyoming `info` responses.
+fn crane_attribution() -> serde_json::Value {
+    serde_json::json!({
+        "name": "Crane",
+        "url": "https://github.com/crane-ai/crane",
+    })
+}
+
+/// Build the `info` event data from registered TTS models.
+///
+/// Each model becomes a `TtsProgram`-shaped JSON value (see the Wyoming
+/// `wyoming/info.py` schema), named after its registration name so two
+/// loaded models of the same architecture don't collide. Voices claimed by
+/// an earlier-priority model (per `voice_map`'s "first model wins" rule)
+/// are excluded from a later model's voice list so clients don't see the
+/// same voice name twice under different programs. Models present in
+/// `runtime` but not part of `voice_map`'s configured set are skipped
+/// entirely, since they would otherwise show up with an empty voice list.
+fn build_info(runtime: &ModelRuntime, voice_map: &VoiceMap) -> InfoData {
+    let mut models: Vec<(&str, &TtsHandle)> = runtime.tts_handles().collect();
+    models.sort_by_key(|(name, _)| *name);
+
+    let tts = models
+        .into_iter()
+        .filter(|(model_name, _)| {
+            let configured = voice_map.has_model(model_name);
+            if !configured {
+                tracing::warn!(
+                    model = %model_name,
+                    "Model in runtime but not in voice map config; excluding from describe response",
+                );
+            }
+            configured
+        })
+        .map(|(model_name, handle)| {
+            let voices: Vec<serde_json::Value> = handle
+                .voices()
+                .iter()
+                .filter(|voice| voice_map.model_for_voice(&voice.name) == Some(model_name))
+                .map(|voice| {
+                    serde_json::json!({
+                        "name": voice.name,
+                        "attribution": crane_attribution(),
+                        "installed": true,
+                        "description": null,
+                        "version": null,
+                        "languages": voice.languages,
+                        "speakers": null,
+                    })
+                })
+                .collect();
+
+            serde_json::json!({
+                "name": model_name,
+                "attribution": crane_attribution(),
+                "installed": true,
+                "description": null,
+                "version": null,
+                "voices": voices,
+                "supports_synthesize_streaming": false,
+            })
+        })
+        .collect();
+
+    InfoData {
+        tts,
+        asr: vec![],
+        wake: vec![],
+    }
 }
 
 /// Send an `error` event with an optional machine-readable code.
@@ -636,13 +728,162 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_describe() {
+    async fn test_describe_no_models() {
         let rt = test_runtime();
         let vm = VoiceMap::new(&[], &rt);
 
         let results = run_events(&rt, &vm, vec![Event::Describe]).await;
 
         assert_eq!(results, vec![Event::Info(InfoData::default())]);
+    }
+
+    #[tokio::test]
+    async fn test_describe_single_model() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "m1".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(24000, voices(&["alice"]))),
+        )
+        .unwrap();
+        let vm = VoiceMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(&rt, &vm, vec![Event::Describe]).await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Event::Info(data) => {
+                assert_eq!(data.tts.len(), 1);
+                assert!(data.asr.is_empty());
+                assert!(data.wake.is_empty());
+                let program = &data.tts[0];
+                assert_eq!(program["name"], "m1");
+                assert_eq!(program["supports_synthesize_streaming"], false);
+                let voices = program["voices"].as_array().unwrap();
+                assert_eq!(voices.len(), 1);
+                assert_eq!(voices[0]["name"], "alice");
+                assert_eq!(voices[0]["languages"], serde_json::json!(["en"]));
+            },
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_multiple_models() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "a".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(24000, voices(&["alice"]))),
+        )
+        .unwrap();
+        rt.register_tts(
+            "b".into(),
+            "voxtral_tts",
+            Box::new(MockTts::new(16000, voices(&["bob"]))),
+        )
+        .unwrap();
+        let vm = VoiceMap::new(&["a".to_string(), "b".to_string()], &rt);
+
+        let results = run_events(&rt, &vm, vec![Event::Describe]).await;
+
+        match &results[0] {
+            Event::Info(data) => {
+                assert_eq!(data.tts.len(), 2);
+                let names: Vec<&str> = data
+                    .tts
+                    .iter()
+                    .map(|p| p["name"].as_str().unwrap())
+                    .collect();
+                assert_eq!(names, vec!["a", "b"]);
+            },
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_voice_conflict_excludes_duplicate() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "first".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(24000, voices(&["alice"]))),
+        )
+        .unwrap();
+        rt.register_tts(
+            "second".into(),
+            "voxtral_tts",
+            Box::new(MockTts::new(16000, voices(&["alice"]))),
+        )
+        .unwrap();
+        let vm = VoiceMap::new(&["first".to_string(), "second".to_string()], &rt);
+
+        let results = run_events(&rt, &vm, vec![Event::Describe]).await;
+
+        match &results[0] {
+            Event::Info(data) => {
+                let by_name = |name: &str| {
+                    data.tts
+                        .iter()
+                        .find(|p| p["name"] == name)
+                        .unwrap_or_else(|| panic!("missing program {name}"))
+                };
+                let first_voices = by_name("first")["voices"].as_array().unwrap();
+                assert_eq!(first_voices.len(), 1);
+                let second_voices = by_name("second")["voices"].as_array().unwrap();
+                assert!(second_voices.is_empty());
+            },
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_excludes_model_not_in_voice_map() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "configured".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(24000, voices(&["alice"]))),
+        )
+        .unwrap();
+        rt.register_tts(
+            "unconfigured".into(),
+            "voxtral_tts",
+            Box::new(MockTts::new(16000, voices(&["bob"]))),
+        )
+        .unwrap();
+        let vm = VoiceMap::new(&["configured".to_string()], &rt);
+
+        let results = run_events(&rt, &vm, vec![Event::Describe]).await;
+
+        match &results[0] {
+            Event::Info(data) => {
+                assert_eq!(data.tts.len(), 1);
+                assert_eq!(data.tts[0]["name"], "configured");
+            },
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_streaming_is_false() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "m1".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(24000, voices(&["alice"]))),
+        )
+        .unwrap();
+        let vm = VoiceMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(&rt, &vm, vec![Event::Describe]).await;
+
+        match &results[0] {
+            Event::Info(data) => {
+                assert_eq!(data.tts[0]["supports_synthesize_streaming"], false);
+            },
+            other => panic!("expected Info, got {other:?}"),
+        }
     }
 
     #[tokio::test]
