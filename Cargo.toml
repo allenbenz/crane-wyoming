@@ -14,10 +14,13 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["io-util", "sync"] }
+tokio = { version = "1", features = ["io-util", "sync", "net", "rt-multi-thread", "macros", "signal", "time"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 tracing = "0.1"
+tracing-subscriber = "0.3"
 crane = { git = "https://github.com/cryptomilk/Crane", branch = "asn-wyoming" }
 crane-core = { git = "https://github.com/cryptomilk/Crane", branch = "asn-wyoming" }
 crane-engine = { git = "https://github.com/cryptomilk/Crane", branch = "asn-wyoming" }
@@ -28,7 +31,3 @@ candle-core = "0.10.2"
 cuda = ["crane-engine/cuda"]
 cudnn = ["crane-engine/cudnn"]
 mkl = ["crane-engine/mkl"]
-
-[dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "io-util"] }
-tokenizers = { version = "0.23", default-features = false, features = ["onig"] }

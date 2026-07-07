@@ -8,6 +8,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use anyhow::Result;
 use candle_core::DType;
@@ -137,13 +138,17 @@ fn resolve_voice<'m, 'd>(
     }
 }
 
+/// How long to wait for the next event before disconnecting an idle client.
+const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
+
 /// Run the Wyoming event loop for a single client connection.
 ///
 /// Reads events from `reader` and dispatches them: `synthesize` requests
 /// generate speech through `runtime`, `ping` is answered with `pong`,
 /// `describe` gets an `info` response with available TTS model metadata, and unrecognized
 /// event types get an `error` response. The loop continues until the
-/// client disconnects cleanly (EOF) or the wire protocol desyncs.
+/// client disconnects cleanly (EOF), the wire protocol desyncs, or the
+/// client goes idle for longer than [`IDLE_TIMEOUT`] between events.
 ///
 /// Application-level failures (unknown voice, generation error) are
 /// reported as Wyoming `error` events and do not terminate the
@@ -170,15 +175,19 @@ where
     W: AsyncWrite + Unpin,
 {
     loop {
-        let event = match read_event(reader).await {
-            Ok(Some(event)) => event,
-            Ok(None) => {
+        let event = match tokio::time::timeout(IDLE_TIMEOUT, read_event(reader)).await {
+            Ok(Ok(Some(event))) => event,
+            Ok(Ok(None)) => {
                 tracing::debug!("Client disconnected");
                 return Ok(());
             },
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, "Failed to read event, disconnecting");
                 return Err(e);
+            },
+            Err(_) => {
+                tracing::info!("Client idle for {IDLE_TIMEOUT:?}, disconnecting");
+                return Ok(());
             },
         };
 
