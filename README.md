@@ -1,5 +1,10 @@
 # crane-wyoming: Self-hosted voice services for Home Assistant
 
+**Alpha quality software.** In its current state, this is for developers and
+advanced users: it depends on unreleased, git-pinned Crane dependencies and
+requires building from source. You have to expect rough edges and no
+compatibility guarantees yet.
+
 [Wyoming](https://github.com/rhasspy/wyoming) is the protocol Home Assistant
 uses to talk to local voice services (wake word, speech-to-text,
 text-to-speech, intent recognition) over the network: a JSON event header per
