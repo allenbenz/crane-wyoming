@@ -13,8 +13,8 @@ use std::time::Duration;
 use anyhow::Result;
 use candle_core::{DType, Tensor};
 use crane::audio::tts::{AudioInfo, pcm_f32_to_i16};
+use crane::engine::{ModelRuntime, TtsGenerateRequest, TtsHandle};
 use crane_core::generation::SpeechOptions;
-use crane_engine::{ModelRuntime, TtsGenerateRequest, TtsHandle};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::oneshot;
 
@@ -233,7 +233,7 @@ fn tensor_to_audio_chunk(tensor: &Tensor, audio_info: AudioInfo) -> Result<Event
     Ok(Event::AudioChunk {
         data: AudioChunkData {
             rate: audio_info.sample_rate,
-            width: audio_info.sample_width_bytes(),
+            width: audio_info.bits_per_sample / 8,
             channels: audio_info.channels,
             timestamp: None,
         },
@@ -246,7 +246,7 @@ fn tensor_to_audio_chunk(tensor: &Tensor, audio_info: AudioInfo) -> Result<Event
 fn audio_start_event(audio_info: AudioInfo) -> Event {
     Event::AudioStart(AudioStartData {
         rate: audio_info.sample_rate,
-        width: audio_info.sample_width_bytes(),
+        width: audio_info.bits_per_sample / 8,
         channels: audio_info.channels,
         timestamp: None,
     })
@@ -461,7 +461,7 @@ where
 /// slow to keep up with real-time incremental generation). Dispatches
 /// through [`ModelRuntime::generate_speech`], which is cache-eligible --
 /// unlike the streaming path, so repeated phrases on slow hardware benefit
-/// from [`crane_engine::TtsCache`]. A failure to encode the generated
+/// from [`crane::engine::TtsCache`]. A failure to encode the generated
 /// tensor after `audio-start` has been sent closes the stream with
 /// `audio-stop` before reporting the `error` event, matching the
 /// mid-stream error convention documented in WYOMING.md.
@@ -633,7 +633,7 @@ mod tests {
     use crate::event::SynthesizeVoice;
     use candle_core::{Device, Tensor};
     use crane::audio::tts::{AudioInfo, Tts, TtsStream, VoiceInfo};
-    use crane_engine::model_factory::ModelType;
+    use crane::engine::model_factory::ModelType;
     use std::io::Cursor as SyncCursor;
     use tokio::io::BufReader;
 

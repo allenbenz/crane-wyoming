@@ -41,8 +41,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use crane_engine::model_factory::ModelType;
-use crane_engine::{ModelRuntime, TtsCache};
+use crane::engine::model_factory::ModelType;
+use crane::engine::{ModelRuntime, TtsCache};
 use tracing::info;
 
 /// Command-line arguments for the Wyoming protocol TTS server.
@@ -523,8 +523,8 @@ mod tests {
     use crate::event::{PingData, SynthesizeData};
     use candle_core::{Device, Tensor};
     use crane::audio::tts::{AudioInfo, Tts, VoiceInfo, pcm_f32_to_i16};
+    use crane::engine::model_factory::ModelType;
     use crane_core::generation::SpeechOptions;
-    use crane_engine::model_factory::ModelType;
     use tokio::net::{TcpListener, TcpStream};
 
     #[test]
