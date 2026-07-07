@@ -22,13 +22,16 @@
 //!
 //! # Module layout
 //!
-//! | Module  | Responsibility                                    |
-//! |---------|----------------------------------------------------|
-//! | `event` | Typed event enum and per-event data structs        |
-//! | `wire`  | Async read/write functions for the wire protocol   |
+//! | Module    | Responsibility                                       |
+//! |-----------|-------------------------------------------------------|
+//! | `event`   | Typed event enum and per-event data structs           |
+//! | `wire`    | Async read/write functions for the wire protocol      |
+//! | `handler` | TTS event handling, dispatching to `ModelRuntime`     |
 
 pub mod event;
+pub mod handler;
 pub mod wire;
 
 pub use event::Event;
+pub use handler::{VoiceMap, handle_connection};
 pub use wire::{MAX_DATA_LENGTH, MAX_HEADER_LINE, MAX_PAYLOAD_LENGTH, read_event, write_event};

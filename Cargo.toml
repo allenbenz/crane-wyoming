@@ -16,7 +16,19 @@ path = "src/lib.rs"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["io-util"] }
+tokio = { version = "1", features = ["io-util", "sync"] }
+tracing = "0.1"
+crane = { git = "https://github.com/cryptomilk/Crane", branch = "asn-wyoming" }
+crane-core = { git = "https://github.com/cryptomilk/Crane", branch = "asn-wyoming" }
+crane-engine = { git = "https://github.com/cryptomilk/Crane", branch = "asn-wyoming" }
+# Must match the candle-core version
+candle-core = "0.10.2"
+
+[features]
+cuda = ["crane-engine/cuda"]
+cudnn = ["crane-engine/cudnn"]
+mkl = ["crane-engine/mkl"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "io-util"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
