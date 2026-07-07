@@ -403,9 +403,16 @@ pub async fn run(args: Args) -> Result<()> {
     #[cfg(not(feature = "cuda"))]
     let dtype = crane_core::models::DType::F32;
 
+    // Incremental streaming is only worth it on a GPU: both CUDA and Metal
+    // have far more memory bandwidth than CPU DDR, which is what
+    // autoregressive TTS generation is bottlenecked on. On CPU, chunks
+    // arrive slower than they play back, producing bursty audio with dead
+    // air -- worse than just waiting once for the full clip.
+    let streaming_enabled = device.is_cuda() || device.is_metal();
+
     let device_name = format!("{device:?}");
     let dtype_name = format!("{dtype:?}");
-    info!("Device: {device_name}, dtype: {dtype_name}");
+    info!("Device: {device_name}, dtype: {dtype_name}, streaming: {streaming_enabled}");
 
     let first_model_path = args
         .model_path
@@ -427,6 +434,7 @@ pub async fn run(args: Args) -> Result<()> {
         tokenizer,
         vec![eos_id],
     );
+    runtime.set_streaming_enabled(streaming_enabled);
 
     if let Some(cache_dir) = &args.tts_cache_dir {
         let max_bytes = parse_size(&args.tts_cache_max_size)?;
