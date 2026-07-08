@@ -24,6 +24,7 @@
 //!
 //! | Module    | Responsibility                                       |
 //! |-----------|-------------------------------------------------------|
+//! | `engine`  | `ModelRuntime` -- owns and dispatches to TTS models   |
 //! | `event`   | Typed event enum and per-event data structs           |
 //! | `wire`    | Async read/write functions for the wire protocol      |
 //! | `handler` | TTS event handling, dispatching to `ModelRuntime`     |
@@ -42,9 +43,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use crane::engine::model_factory::ModelType;
-use crane::engine::{ModelRuntime, TtsCache};
 use tracing::info;
+
+use crate::engine::ModelRuntime;
 
 /// Command-line arguments for the Wyoming protocol TTS server.
 #[derive(Parser, Debug, Clone)]
@@ -76,76 +77,6 @@ pub struct Args {
     /// Maximum number of concurrent client connections.
     #[arg(long, default_value_t = 16)]
     pub max_connections: usize,
-
-    /// Directory for the on-disk TTS response cache. Omit to disable caching.
-    #[arg(long)]
-    pub tts_cache_dir: Option<PathBuf>,
-
-    /// Maximum size of the TTS cache, e.g. `"500M"` or `"1G"`.
-    #[arg(long, default_value = "500M")]
-    pub tts_cache_max_size: String,
-}
-
-/// Parse a human-readable byte size string (e.g. `"500M"`, `"1G"`, `"1024"`)
-/// into a byte count.
-///
-/// Accepts optional `K`/`M`/`G` suffixes (case-insensitive), with or without
-/// a trailing `B` (so `"500M"` and `"500MB"` are equivalent). A bare integer
-/// is interpreted as a byte count.
-///
-/// # Errors
-///
-/// Returns an error if `s` is empty or not a valid size string.
-fn parse_size(s: &str) -> Result<u64> {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("empty size string");
-    }
-    let upper = trimmed.to_ascii_uppercase();
-    let (num_part, multiplier) =
-        if let Some(prefix) = upper.strip_suffix("GB").or_else(|| upper.strip_suffix('G')) {
-            (prefix, 1024u64.pow(3))
-        } else if let Some(prefix) = upper.strip_suffix("MB").or_else(|| upper.strip_suffix('M')) {
-            (prefix, 1024u64.pow(2))
-        } else if let Some(prefix) = upper.strip_suffix("KB").or_else(|| upper.strip_suffix('K')) {
-            (prefix, 1024u64)
-        } else {
-            (upper.as_str(), 1u64)
-        };
-    let value: f64 = num_part
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid size string: {s}"))?;
-    if value < 0.0 {
-        anyhow::bail!("negative size is not allowed: {s}");
-    }
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )]
-    let bytes = (value * multiplier as f64) as u64;
-    Ok(bytes)
-}
-
-/// Load the tokenizer for a TTS-only model, falling back to a stub tokenizer
-/// (TTS models don't need one for generation, only for `ModelRuntime`
-/// metadata plumbing shared with the LLM code path).
-fn load_tts_tokenizer(model_path: &str) -> tokenizers::Tokenizer {
-    crane_core::utils::tokenizer_utils::load_tokenizer_from_model_dir(model_path).unwrap_or_else(
-        |e| {
-            tracing::warn!("Failed to load HF tokenizer: {e}; creating stub for TTS-only mode");
-            tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
-        },
-    )
-}
-
-/// Detect the EOS token ID from a loaded tokenizer.
-fn detect_tts_eos(tokenizer: &tokenizers::Tokenizer) -> u32 {
-    tokenizer
-        .token_to_id("<|im_end|>")
-        .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
-        .unwrap_or(2)
 }
 
 /// Initialize the tracing subscriber with compact formatting.
@@ -364,10 +295,10 @@ async fn serve_connection(
 
 /// Run the Wyoming protocol TTS server.
 ///
-/// Loads each `--model-path` into a shared [`ModelRuntime`], optionally enables
-/// the on-disk TTS cache, then accepts connections on the address resolved
-/// from `--uri` (or `args.host`:`args.port` if unset) -- either TCP or a
-/// Unix domain socket. Each connection is handled on its own tokio task via
+/// Loads each `--model-path` into a shared [`ModelRuntime`], then accepts
+/// connections on the address resolved from `--uri` (or
+/// `args.host`:`args.port` if unset) -- either TCP or a Unix domain socket.
+/// Each connection is handled on its own tokio task via
 /// [`handle_connection`]; TTS requests from all connections queue on the
 /// target model's dedicated thread and are processed one at a time.
 ///
@@ -415,33 +346,12 @@ pub async fn run(args: Args) -> Result<()> {
     let dtype_name = format!("{dtype:?}");
     info!("Device: {device_name}, dtype: {dtype_name}, streaming: {streaming_enabled}");
 
-    let first_model_path = args
-        .model_path
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("at least one --model-path is required"))?;
-    let first_model_str = first_model_path.to_string_lossy();
-    let tokenizer = load_tts_tokenizer(&first_model_str);
-    let eos_id = detect_tts_eos(&tokenizer);
-    let model_name = first_model_path.file_name().map_or_else(
-        || "crane-wyoming".to_string(),
-        |n| n.to_string_lossy().to_string(),
-    );
-
-    let mut runtime = ModelRuntime::new(
-        model_name,
-        ModelType::Auto,
-        dtype_name,
-        device_name,
-        tokenizer,
-        vec![eos_id],
-    );
-    runtime.set_streaming_enabled(streaming_enabled);
-
-    if let Some(cache_dir) = &args.tts_cache_dir {
-        let max_bytes = parse_size(&args.tts_cache_max_size)?;
-        runtime.set_tts_cache(TtsCache::new(cache_dir.clone(), max_bytes)?);
-        info!(dir = %cache_dir.display(), max = %args.tts_cache_max_size, "TTS cache enabled");
+    if args.model_path.is_empty() {
+        anyhow::bail!("at least one --model-path is required");
     }
+
+    let mut runtime = ModelRuntime::new();
+    runtime.set_streaming_enabled(streaming_enabled);
 
     let mut model_names = Vec::with_capacity(args.model_path.len());
     for model_path in &args.model_path {
@@ -524,59 +434,8 @@ mod tests {
     use crate::event::{PingData, SynthesizeData};
     use candle_core::{Device, Tensor};
     use crane::audio::tts::{AudioInfo, Tts, VoiceInfo, pcm_f32_to_i16};
-    use crane::engine::model_factory::ModelType;
     use crane_core::generation::SpeechOptions;
     use tokio::net::{TcpListener, TcpStream};
-
-    #[test]
-    fn parse_size_bare_bytes() {
-        assert_eq!(parse_size("1024").unwrap(), 1024);
-    }
-
-    #[test]
-    fn parse_size_kilobytes() {
-        assert_eq!(parse_size("500K").unwrap(), 500 * 1024);
-        assert_eq!(parse_size("500KB").unwrap(), 500 * 1024);
-    }
-
-    #[test]
-    fn parse_size_megabytes() {
-        assert_eq!(parse_size("500M").unwrap(), 500 * 1024 * 1024);
-        assert_eq!(parse_size("100MB").unwrap(), 100 * 1024 * 1024);
-    }
-
-    #[test]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn parse_size_gigabytes() {
-        assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(
-            parse_size("1.5G").unwrap(),
-            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
-        );
-    }
-
-    #[test]
-    fn parse_size_lowercase_suffix() {
-        assert_eq!(parse_size("500m").unwrap(), 500 * 1024 * 1024);
-    }
-
-    #[test]
-    fn parse_size_rejects_empty() {
-        assert!(parse_size("").is_err());
-        assert!(parse_size("   ").is_err());
-    }
-
-    #[test]
-    fn parse_size_rejects_invalid() {
-        assert!(parse_size("abc").is_err());
-        assert!(parse_size("M").is_err());
-    }
-
-    #[test]
-    fn parse_size_rejects_negative() {
-        assert!(parse_size("-500M").is_err());
-        assert!(parse_size("-1").is_err());
-    }
 
     struct MockTts {
         audio_info: AudioInfo,
@@ -618,15 +477,7 @@ mod tests {
     }
 
     fn test_runtime() -> ModelRuntime {
-        let tokenizer = tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default());
-        ModelRuntime::new(
-            "test-model".into(),
-            ModelType::Qwen3TTS,
-            "F32".into(),
-            "Cpu".into(),
-            tokenizer,
-            vec![2],
-        )
+        ModelRuntime::new()
     }
 
     async fn spawn_test_server(runtime: ModelRuntime, voice_map: VoiceMap) -> std::net::SocketAddr {
@@ -730,8 +581,6 @@ mod tests {
             uri: Some(uri.to_string()),
             cpu: false,
             max_connections: 16,
-            tts_cache_dir: None,
-            tts_cache_max_size: "500M".into(),
         }
     }
 

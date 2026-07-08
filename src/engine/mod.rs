@@ -7,5 +7,9 @@
 //! | Module          | Responsibility                                   |
 //! |-----------------|--------------------------------------------------|
 //! | `model_factory` | TTS model type auto-detection and construction    |
+//! | `runtime`       | `ModelRuntime` -- owns loaded TTS models          |
 
 pub mod model_factory;
+pub mod runtime;
+
+pub use runtime::{ModelRuntime, TtsGenerateRequest, TtsHandle};

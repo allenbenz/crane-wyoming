@@ -13,8 +13,9 @@ use std::time::Duration;
 use anyhow::Result;
 use candle_core::{DType, Tensor};
 use crane::audio::tts::{AudioInfo, pcm_f32_to_i16};
-use crane::engine::{ModelRuntime, TtsGenerateRequest, TtsHandle};
 use crane_core::generation::SpeechOptions;
+
+use crate::engine::{ModelRuntime, TtsGenerateRequest, TtsHandle};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::oneshot;
 
@@ -633,7 +634,6 @@ mod tests {
     use crate::event::SynthesizeVoice;
     use candle_core::{Device, Tensor};
     use crane::audio::tts::{AudioInfo, Tts, TtsStream, VoiceInfo};
-    use crane::engine::model_factory::ModelType;
     use std::io::Cursor as SyncCursor;
     use tokio::io::BufReader;
 
@@ -797,15 +797,7 @@ mod tests {
     }
 
     fn test_runtime() -> ModelRuntime {
-        let tokenizer = tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default());
-        ModelRuntime::new(
-            "test-model".into(),
-            ModelType::Qwen3TTS,
-            "F32".into(),
-            "Cpu".into(),
-            tokenizer,
-            vec![2],
-        )
+        ModelRuntime::new()
     }
 
     fn voices(names: &[&str]) -> Vec<VoiceInfo> {
