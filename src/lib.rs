@@ -545,6 +545,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn parse_size_gigabytes() {
         assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
         assert_eq!(
