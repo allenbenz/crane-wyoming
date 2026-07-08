@@ -1047,7 +1047,7 @@ mod tests {
             &rt,
             &vm,
             vec![Event::Synthesize(SynthesizeData {
-                text: "".into(),
+                text: String::new(),
                 voice: None,
             })],
         )
