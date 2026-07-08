@@ -298,7 +298,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn round_trip(event: Event) -> Event {
+    fn round_trip(event: &Event) -> Event {
         let event_type = event.event_type().to_string();
         let data_bytes = event.serialize_data().expect("serialize_data");
         let payload = event.payload().map(<[u8]>::to_vec);
@@ -317,7 +317,7 @@ mod tests {
             channels: 1,
             timestamp: Some(123),
         });
-        assert_eq!(round_trip(event.clone()), event);
+        assert_eq!(round_trip(&event), event);
     }
 
     #[test]
@@ -328,7 +328,7 @@ mod tests {
             channels: 1,
             timestamp: None,
         });
-        assert_eq!(round_trip(event.clone()), event);
+        assert_eq!(round_trip(&event), event);
     }
 
     #[test]
@@ -342,7 +342,7 @@ mod tests {
             },
             audio: vec![1, 2, 3, 4],
         };
-        let result = round_trip(event.clone());
+        let result = round_trip(&event);
         assert_eq!(result, event);
         match result {
             Event::AudioChunk { audio, .. } => assert_eq!(audio, vec![1, 2, 3, 4]),
@@ -371,10 +371,10 @@ mod tests {
         let event = Event::AudioStop(AudioStopData {
             timestamp: Some(42),
         });
-        assert_eq!(round_trip(event.clone()), event);
+        assert_eq!(round_trip(&event), event);
 
         let event_no_ts = Event::AudioStop(AudioStopData { timestamp: None });
-        assert_eq!(round_trip(event_no_ts.clone()), event_no_ts);
+        assert_eq!(round_trip(&event_no_ts), event_no_ts);
     }
 
     #[test]
@@ -387,7 +387,7 @@ mod tests {
                 speaker: Some("default".to_string()),
             }),
         });
-        assert_eq!(round_trip(event.clone()), event);
+        assert_eq!(round_trip(&event), event);
     }
 
     #[test]
@@ -396,7 +396,7 @@ mod tests {
             text: "hi".to_string(),
             voice: None,
         });
-        assert_eq!(round_trip(event.clone()), event);
+        assert_eq!(round_trip(&event), event);
     }
 
     #[test]
@@ -404,7 +404,7 @@ mod tests {
         let event = Event::Describe;
         assert_eq!(event.serialize_data().unwrap(), None);
         assert_eq!(event.payload(), None);
-        assert_eq!(round_trip(event.clone()), event);
+        assert_eq!(round_trip(&event), event);
     }
 
     #[test]
@@ -414,18 +414,18 @@ mod tests {
             asr: vec![],
             wake: vec![],
         });
-        assert_eq!(round_trip(event.clone()), event);
+        assert_eq!(round_trip(&event), event);
     }
 
     #[test]
     fn test_ping_pong_round_trip() {
-        let ping = Event::Ping(PingData {
+        let keepalive_request = Event::Ping(PingData {
             text: Some("hi".to_string()),
         });
-        assert_eq!(round_trip(ping.clone()), ping);
+        assert_eq!(round_trip(&keepalive_request), keepalive_request);
 
-        let pong = Event::Pong(PongData { text: None });
-        assert_eq!(round_trip(pong.clone()), pong);
+        let keepalive_reply = Event::Pong(PongData { text: None });
+        assert_eq!(round_trip(&keepalive_reply), keepalive_reply);
     }
 
     #[test]
@@ -434,13 +434,13 @@ mod tests {
             text: "bad voice".to_string(),
             code: Some("voice-not-found".to_string()),
         });
-        assert_eq!(round_trip(event.clone()), event);
+        assert_eq!(round_trip(&event), event);
 
         let event_no_code = Event::Error(ErrorData {
             text: "oops".to_string(),
             code: None,
         });
-        assert_eq!(round_trip(event_no_code.clone()), event_no_code);
+        assert_eq!(round_trip(&event_no_code), event_no_code);
     }
 
     #[test]
@@ -450,7 +450,7 @@ mod tests {
             data: json!({"foo": "bar"}),
             payload: Some(vec![5, 6, 7]),
         };
-        assert_eq!(round_trip(event.clone()), event);
+        assert_eq!(round_trip(&event), event);
     }
 
     #[test]
@@ -469,7 +469,7 @@ mod tests {
             data: json!({}),
             payload: None,
         };
-        assert_eq!(round_trip(event), expected);
+        assert_eq!(round_trip(&event), expected);
     }
 
     #[test]
