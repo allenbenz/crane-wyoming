@@ -28,6 +28,7 @@
 //! | `wire`    | Async read/write functions for the wire protocol      |
 //! | `handler` | TTS event handling, dispatching to `ModelRuntime`     |
 
+pub mod engine;
 pub mod event;
 pub mod handler;
 pub mod wire;

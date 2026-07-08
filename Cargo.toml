@@ -27,6 +27,9 @@ crane-core = { git = "https://github.com/cryptomilk/Crane", branch = "asn-wyomin
 # Must match the candle-core version
 candle-core = "0.10.2"
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 cuda = ["crane/cuda"]
 cudnn = ["crane/cudnn"]
