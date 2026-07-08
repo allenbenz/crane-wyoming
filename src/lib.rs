@@ -51,39 +51,45 @@ use crate::engine::ModelRuntime;
 #[derive(Parser, Debug, Clone)]
 #[command(about = "Wyoming protocol TTS server for Home Assistant voice integration")]
 pub struct Args {
-    /// Path to a TTS model directory. Repeat to load multiple models; the
-    /// first `--model-path` becomes the default voice when a client does not
-    /// request one by name.
-    #[arg(short = 'm', long = "model-path", required = true)]
+    /// Path to a TTS model directory. Separate multiple paths with `;` to
+    /// load multiple models; the first path becomes the default voice when
+    /// a client does not request one by name.
+    #[arg(
+        short = 'm',
+        long = "model-path",
+        required = true,
+        env = "CRANE_WYOMING_MODEL_PATH",
+        value_delimiter = ';'
+    )]
     pub model_path: Vec<PathBuf>,
 
     /// TCP port to listen on.
-    #[arg(short = 'p', long, default_value_t = 10200)]
+    #[arg(short = 'p', long, default_value_t = 10200, env = "CRANE_WYOMING_PORT")]
     pub port: u16,
 
     /// Host address to bind to.
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "0.0.0.0", env = "CRANE_WYOMING_HOST")]
     pub host: String,
 
     /// Address to listen on, given as a URI: `tcp://host:port` or
     /// `unix:///path/to/socket`. Overrides `--host`/`--port` when set.
-    #[arg(long)]
+    #[arg(long, env = "CRANE_WYOMING_URI")]
     pub uri: Option<String>,
 
     /// Force CPU-only inference (disables CUDA/Metal auto-detection).
-    #[arg(long)]
+    #[arg(long, env = "CRANE_WYOMING_CPU")]
     pub cpu: bool,
 
     /// Maximum number of concurrent client connections.
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 16, env = "CRANE_WYOMING_MAX_CONNECTIONS")]
     pub max_connections: usize,
 
     /// Directory for the on-disk TTS response cache. Omit to disable caching.
-    #[arg(long)]
+    #[arg(long, env = "CRANE_WYOMING_TTS_CACHE_DIR")]
     pub tts_cache_dir: Option<PathBuf>,
 
     /// Maximum size of the TTS cache, e.g. `"500M"` or `"1G"`.
-    #[arg(long, default_value = "500M")]
+    #[arg(long, default_value = "500M", env = "CRANE_WYOMING_TTS_CACHE_MAX_SIZE")]
     pub tts_cache_max_size: String,
 }
 
