@@ -8,8 +8,11 @@
 //! |-----------------|--------------------------------------------------|
 //! | `model_factory` | TTS model type auto-detection and construction    |
 //! | `runtime`       | `ModelRuntime` -- owns loaded TTS models          |
+//! | `cache`         | `TtsCache` -- optional disk cache for TTS responses |
 
+pub mod cache;
 pub mod model_factory;
 pub mod runtime;
 
+pub use cache::TtsCache;
 pub use runtime::{ModelRuntime, TtsGenerateRequest, TtsHandle};
