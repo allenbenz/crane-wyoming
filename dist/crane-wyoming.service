@@ -1,0 +1,31 @@
+[Unit]
+Description=Crane Wyoming TTS Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/crane-wyoming
+ExecStart=/usr/local/bin/crane-wyoming
+Restart=on-failure
+RestartSec=5
+
+# Hardening. No User= is set here: pick a static user (and, for GPU
+# builds, add it to the `video`/`render` group) or use DynamicUser=yes,
+# depending on your deployment. Model and cache paths need read/write
+# access from whichever user runs this unit -- grant it with
+# `systemctl edit crane-wyoming`, e.g.:
+#   [Service]
+#   User=crane-wyoming
+#   ReadOnlyPaths=/srv/models
+#   ReadWritePaths=/var/cache/crane-wyoming
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

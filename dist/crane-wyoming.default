@@ -1,0 +1,32 @@
+# Environment file for the crane-wyoming systemd service.
+# Install as /etc/default/crane-wyoming (loaded via EnvironmentFile= in
+# crane-wyoming.service). Every setting here can also be passed as a CLI
+# flag; a flag on the command line always overrides the matching variable.
+#
+# Uncomment and edit the variables you need.
+
+# Required: one or more TTS model directories, separated by ';'.
+# The first path is the default voice when a client does not request one.
+#CRANE_WYOMING_MODEL_PATH=/srv/models/Voxtral-4B-TTS-2603;/srv/models/Qwen3-TTS
+
+# TCP port to listen on (default: 10200).
+#CRANE_WYOMING_PORT=10200
+
+# Host address to bind to (default: 0.0.0.0).
+#CRANE_WYOMING_HOST=0.0.0.0
+
+# Listen address as a URI: tcp://host:port or unix:///path/to/socket.
+# Overrides CRANE_WYOMING_HOST/CRANE_WYOMING_PORT when set.
+#CRANE_WYOMING_URI=unix:///run/crane-wyoming/wyoming.sock
+
+# Force CPU-only inference, disabling CUDA/Metal auto-detection.
+#CRANE_WYOMING_CPU=false
+
+# Maximum number of concurrent client connections (default: 16).
+#CRANE_WYOMING_MAX_CONNECTIONS=16
+
+# Directory for the on-disk TTS response cache. Omit to disable caching.
+#CRANE_WYOMING_TTS_CACHE_DIR=/var/cache/crane-wyoming
+
+# Maximum size of the TTS cache, e.g. "500M" or "1G" (default: 500M).
+#CRANE_WYOMING_TTS_CACHE_MAX_SIZE=500M
