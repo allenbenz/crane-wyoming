@@ -1,0 +1,9 @@
+[Unit]
+Description=Crane Wyoming TTS Socket
+
+[Socket]
+ListenStream=%t/crane-wyoming/tts.sock
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target

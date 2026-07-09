@@ -1,0 +1,12 @@
+[Unit]
+Description=Crane Wyoming TTS Server
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/crane-wyoming
+ExecStart=/usr/local/bin/crane-wyoming
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

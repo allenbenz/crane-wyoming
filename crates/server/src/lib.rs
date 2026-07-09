@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::engine::ModelRuntime;
 
@@ -211,6 +211,43 @@ fn socket_inode(path: &std::path::Path) -> Result<SocketInode> {
     })
 }
 
+/// The fd systemd passes the first (and, for us, only) listening socket on,
+/// per the `sd_listen_fds` protocol.
+#[cfg(unix)]
+const SD_LISTEN_FDS_START: std::os::unix::io::RawFd = 3;
+
+/// Check whether systemd has passed us a pre-bound listening socket via
+/// socket activation (`LISTEN_PID`/`LISTEN_FDS` env vars), returning its fd.
+///
+/// Returns `None` if `LISTEN_PID` doesn't match this process, or `LISTEN_FDS`
+/// isn't exactly `1` (we only support a single activated socket). On success,
+/// clears both env vars per the `sd_listen_fds` protocol, so a subprocess we
+/// spawn later doesn't also try to claim the fd.
+#[cfg(unix)]
+fn systemd_listen_fd() -> Option<std::os::unix::io::RawFd> {
+    let listen_pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
+    if listen_pid != std::process::id() {
+        return None;
+    }
+    let listen_fds: u32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
+    if listen_fds != 1 {
+        warn!(
+            listen_fds,
+            "Ignoring systemd socket activation: expected exactly 1 LISTEN_FDS"
+        );
+        return None;
+    }
+
+    // SAFETY: `run()` calls this before loading any TTS models, which is
+    // the first point it spawns other threads (one worker thread per
+    // model). No other thread exists yet to race on these variables.
+    unsafe {
+        std::env::remove_var("LISTEN_PID");
+        std::env::remove_var("LISTEN_FDS");
+    }
+    Some(SD_LISTEN_FDS_START)
+}
+
 /// A bound listener, either TCP or (on Unix platforms) a Unix domain socket.
 enum Listener {
     /// TCP listener.
@@ -219,6 +256,11 @@ enum Listener {
     /// (for cleanup on drop).
     #[cfg(unix)]
     Unix(tokio::net::UnixListener, PathBuf, SocketInode),
+    /// Unix domain socket listener passed to us by systemd via socket
+    /// activation. Unlike `Unix`, the socket file is owned and managed by
+    /// systemd, not this process, so it must not be unlinked on drop.
+    #[cfg(unix)]
+    Systemd(tokio::net::UnixListener),
 }
 
 impl Listener {
@@ -248,6 +290,31 @@ impl Listener {
         }
     }
 
+    /// Wrap a systemd-provided listening socket fd (from [`systemd_listen_fd`])
+    /// into a [`Listener::Systemd`].
+    ///
+    /// # Safety
+    ///
+    /// `fd` must be a valid, open listening Unix domain socket file
+    /// descriptor owned by this process (i.e. one obtained from
+    /// `systemd_listen_fd`), not already wrapped by another owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fd cannot be set non-blocking or registered
+    /// with the tokio runtime.
+    #[cfg(unix)]
+    unsafe fn from_systemd_fd(fd: std::os::unix::io::RawFd) -> Result<Self> {
+        use std::os::unix::io::FromRawFd;
+
+        // SAFETY: Caller guarantees `fd` is a valid, owned listening socket.
+        let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+        std_listener.set_nonblocking(true)?;
+        Ok(Self::Systemd(tokio::net::UnixListener::from_std(
+            std_listener,
+        )?))
+    }
+
     /// Accept the next connection, returning the stream and a display
     /// string identifying the peer (a socket address for TCP; a fixed
     /// label for Unix sockets, which have no meaningful peer address).
@@ -258,7 +325,7 @@ impl Listener {
                 Ok((Stream::Tcp(stream), addr.to_string()))
             },
             #[cfg(unix)]
-            Self::Unix(listener, ..) => {
+            Self::Unix(listener, ..) | Self::Systemd(listener) => {
                 let (stream, _addr) = listener.accept().await?;
                 Ok((Stream::Unix(stream), "unix-socket-client".to_string()))
             },
@@ -273,6 +340,17 @@ impl Listener {
                 .map_or_else(|_| "unknown".to_string(), |a| a.to_string()),
             #[cfg(unix)]
             Self::Unix(_, path, _) => format!("unix://{}", path.display()),
+            #[cfg(unix)]
+            Self::Systemd(listener) => {
+                let path = listener
+                    .local_addr()
+                    .ok()
+                    .and_then(|a| a.as_pathname().map(|p| p.display().to_string()));
+                match path {
+                    Some(p) => format!("unix://{p} (systemd)"),
+                    None => "unix://systemd-socket (systemd)".to_string(),
+                }
+            },
         }
     }
 }
@@ -282,7 +360,8 @@ impl Drop for Listener {
     /// socket for the next run -- but only if the file at `path` is still
     /// the same socket this listener bound (identified by device+inode),
     /// so a socket that another process has since rebound at the same path
-    /// is left alone.
+    /// is left alone. `Systemd` is deliberately excluded: that socket file
+    /// is owned and managed by systemd, not this process.
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Self::Unix(_, path, inode) = self
@@ -388,6 +467,21 @@ pub async fn run(args: Args) -> Result<()> {
         anyhow::bail!("at least one --model-path is required");
     }
 
+    // Resolved before model loading so `systemd_listen_fd`'s env-var cleanup
+    // (see its doc comment) runs while this process is still single-threaded,
+    // i.e. before `load_tts` below spawns per-model worker threads.
+    #[cfg(unix)]
+    let listener = if let Some(fd) = systemd_listen_fd() {
+        info!(fd, "Using systemd-provided listening socket");
+        // SAFETY: `systemd_listen_fd` verified `LISTEN_PID`/`LISTEN_FDS`,
+        // so `fd` is a listening socket systemd handed to this process.
+        unsafe { Listener::from_systemd_fd(fd)? }
+    } else {
+        Listener::bind(resolve_bind_target(&args)?).await?
+    };
+    #[cfg(not(unix))]
+    let listener = Listener::bind(resolve_bind_target(&args)?).await?;
+
     let mut runtime = ModelRuntime::new();
     runtime.set_streaming_enabled(streaming_enabled);
 
@@ -409,7 +503,6 @@ pub async fn run(args: Args) -> Result<()> {
     let runtime = Arc::new(runtime);
     let voice_map = Arc::new(voice_map);
 
-    let listener = Listener::bind(resolve_bind_target(&args)?).await?;
     info!(
         version = env!("CARGO_PKG_VERSION"),
         listen = %listener.display_addr(),
@@ -976,5 +1069,111 @@ mod tests {
             Event::Pong(data) => assert_eq!(data.text.as_deref(), Some("hi")),
             other => panic!("expected Pong, got {other:?}"),
         }
+    }
+
+    // Guards tests that mutate the process-global LISTEN_PID/LISTEN_FDS env
+    // vars, since `cargo test` runs `#[test]` functions concurrently.
+    #[cfg(unix)]
+    static SYSTEMD_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_listen_fd_detection() {
+        let _guard = SYSTEMD_ENV_LOCK.lock().unwrap();
+
+        // No LISTEN_PID/LISTEN_FDS set: not activated by systemd.
+        assert!(systemd_listen_fd().is_none());
+
+        // A LISTEN_PID that doesn't match this process must be ignored.
+        // SAFETY: guarded by SYSTEMD_ENV_LOCK; no other test reads these vars concurrently.
+        unsafe {
+            std::env::set_var("LISTEN_PID", "4294967295");
+            std::env::set_var("LISTEN_FDS", "1");
+        }
+        assert!(systemd_listen_fd().is_none());
+
+        // SAFETY: guarded by SYSTEMD_ENV_LOCK; no other test reads these vars concurrently.
+        unsafe {
+            std::env::remove_var("LISTEN_PID");
+            std::env::remove_var("LISTEN_FDS");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_listen_fd_detection_matching_pid() {
+        let _guard = SYSTEMD_ENV_LOCK.lock().unwrap();
+
+        // A matching LISTEN_PID and LISTEN_FDS=1 must be detected, and both
+        // env vars cleared afterward per the sd_listen_fds protocol.
+        // SAFETY: guarded by SYSTEMD_ENV_LOCK; no other test reads these vars concurrently.
+        unsafe {
+            std::env::set_var("LISTEN_PID", std::process::id().to_string());
+            std::env::set_var("LISTEN_FDS", "1");
+        }
+        assert_eq!(systemd_listen_fd(), Some(SD_LISTEN_FDS_START));
+        assert!(std::env::var("LISTEN_PID").is_err());
+        assert!(std::env::var("LISTEN_FDS").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn systemd_listener_from_fd_does_not_unlink_on_drop() {
+        use std::os::unix::io::IntoRawFd;
+
+        let socket_path = std::env::temp_dir().join(format!(
+            "crane-wyoming-test-systemd-{}.sock",
+            std::process::id()
+        ));
+        let std_listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let fd = std_listener.into_raw_fd();
+
+        // SAFETY: `fd` is a listening socket we just created and own.
+        let listener = unsafe { Listener::from_systemd_fd(fd).unwrap() };
+        assert!(listener.display_addr().contains("systemd"));
+
+        drop(listener);
+        assert!(
+            socket_path.exists(),
+            "dropping a Systemd listener must not unlink the socket file"
+        );
+        std::fs::remove_file(&socket_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn systemd_listener_ping_pong() {
+        use std::os::unix::io::IntoRawFd;
+
+        let socket_path = std::env::temp_dir().join(format!(
+            "crane-wyoming-test-systemd-accept-{}.sock",
+            std::process::id()
+        ));
+        let std_listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let fd = std_listener.into_raw_fd();
+
+        // SAFETY: `fd` is a listening socket we just created and own.
+        let listener = unsafe { Listener::from_systemd_fd(fd).unwrap() };
+
+        let rt = test_runtime();
+        let vm = VoiceMap::new(&[], &rt);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
+        tokio::spawn(serve(listener, Arc::new(rt), Arc::new(vm), semaphore));
+
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        write_event(&mut writer, &Event::Ping(PingData::with_text("hi")))
+            .await
+            .unwrap();
+
+        let response = read_event(&mut reader).await.unwrap().unwrap();
+        match response {
+            Event::Pong(data) => assert_eq!(data.text.as_deref(), Some("hi")),
+            other => panic!("expected Pong, got {other:?}"),
+        }
+
+        std::fs::remove_file(&socket_path).unwrap();
     }
 }
