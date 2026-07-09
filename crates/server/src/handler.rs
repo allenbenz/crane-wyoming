@@ -20,8 +20,8 @@ use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::oneshot;
 
 use wyoming_protocol::event::{
-    AudioChunkData, AudioStartData, AudioStopData, ErrorData, Event, InfoData, PingData, PongData,
-    SynthesizeData,
+    AudioChunkData, AudioFormat, AudioStartData, AudioStopData, ErrorData, Event, InfoData,
+    PingData, PongData, SynthesizeData,
 };
 use wyoming_protocol::wire::{read_event, write_event};
 
@@ -200,7 +200,11 @@ where
             },
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "Failed to read event, disconnecting");
-                return Err(e);
+                // Protocol errors are intentionally erased to anyhow here:
+                // the server logs them above and does not need to match on
+                // a specific ProtocolError variant. The typed error exists
+                // for downstream library consumers of wyoming-protocol.
+                return Err(e.into());
             },
             Err(_) => {
                 tracing::info!("Client idle for {IDLE_TIMEOUT:?}, disconnecting");
@@ -232,12 +236,7 @@ where
 fn tensor_to_audio_chunk(tensor: &Tensor, audio_info: AudioInfo) -> Result<Event> {
     let samples: Vec<f32> = tensor.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
     Ok(Event::AudioChunk {
-        data: AudioChunkData {
-            rate: audio_info.sample_rate,
-            width: audio_info.bits_per_sample / 8,
-            channels: audio_info.channels,
-            timestamp: None,
-        },
+        data: AudioChunkData::new(audio_format(audio_info)),
         audio: pcm_f32_to_i16(&samples),
     })
 }
@@ -245,12 +244,16 @@ fn tensor_to_audio_chunk(tensor: &Tensor, audio_info: AudioInfo) -> Result<Event
 /// Build the `audio-start` event announcing the format of the audio that
 /// will follow.
 fn audio_start_event(audio_info: AudioInfo) -> Event {
-    Event::AudioStart(AudioStartData {
+    Event::AudioStart(AudioStartData::new(audio_format(audio_info)))
+}
+
+/// Convert Crane's [`AudioInfo`] into the protocol's [`AudioFormat`].
+fn audio_format(audio_info: AudioInfo) -> AudioFormat {
+    AudioFormat {
         rate: audio_info.sample_rate,
         width: audio_info.bits_per_sample / 8,
         channels: audio_info.channels,
-        timestamp: None,
-    })
+    }
 }
 
 /// Write an event to `writer`, giving up after [`WRITE_TIMEOUT`].
@@ -261,9 +264,19 @@ async fn write_event_timeout<W>(writer: &mut W, event: &Event) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    tokio::time::timeout(WRITE_TIMEOUT, write_event(writer, event))
-        .await
-        .map_err(|_| anyhow::anyhow!("Write timed out after {WRITE_TIMEOUT:?}"))?
+    match tokio::time::timeout(WRITE_TIMEOUT, write_event(writer, event)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_elapsed) => Err(anyhow::anyhow!("Write timed out after {WRITE_TIMEOUT:?}")),
+    }
+}
+
+/// Build an `error` event's data from a message and optional code.
+fn error_data(text: &str, code: Option<&str>) -> ErrorData {
+    match code {
+        Some(code) => ErrorData::new(text).with_code(code),
+        None => ErrorData::new(text),
+    }
 }
 
 /// Send an `error` event, giving up after [`WRITE_TIMEOUT`].
@@ -271,14 +284,7 @@ async fn send_error_timeout<W>(writer: &mut W, text: &str, code: Option<&str>) -
 where
     W: AsyncWrite + Unpin,
 {
-    write_event_timeout(
-        writer,
-        &Event::Error(ErrorData {
-            text: text.to_string(),
-            code: code.map(String::from),
-        }),
-    )
-    .await
+    write_event_timeout(writer, &Event::Error(error_data(text, code))).await
 }
 
 /// Close an in-progress audio stream with `audio-stop`, then report `text`
@@ -288,7 +294,7 @@ async fn stop_stream_with_error<W>(writer: &mut W, text: &str) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    write_event_timeout(writer, &Event::AudioStop(AudioStopData { timestamp: None })).await?;
+    write_event_timeout(writer, &Event::AudioStop(AudioStopData::new())).await?;
     send_error_timeout(writer, text, None).await
 }
 
@@ -413,11 +419,7 @@ where
         None => {
             tracing::debug!("TTS stream produced no audio chunks");
             write_event_timeout(writer, &audio_start_event(params.audio_info)).await?;
-            return write_event_timeout(
-                writer,
-                &Event::AudioStop(AudioStopData { timestamp: None }),
-            )
-            .await;
+            return write_event_timeout(writer, &Event::AudioStop(AudioStopData::new())).await;
         },
     };
 
@@ -446,11 +448,7 @@ where
                     .await;
             },
             None => {
-                return write_event_timeout(
-                    writer,
-                    &Event::AudioStop(AudioStopData { timestamp: None }),
-                )
-                .await;
+                return write_event_timeout(writer, &Event::AudioStop(AudioStopData::new())).await;
             },
         }
     }
@@ -508,11 +506,11 @@ where
         Ok(event) => write_event(writer, &event).await?,
         Err(e) => {
             tracing::error!(error = %e, "Failed to encode audio chunk");
-            write_event(writer, &Event::AudioStop(AudioStopData { timestamp: None })).await?;
+            write_event(writer, &Event::AudioStop(AudioStopData::new())).await?;
             return send_error(writer, &format!("Audio encoding failed: {e}"), None).await;
         },
     }
-    write_event(writer, &Event::AudioStop(AudioStopData { timestamp: None })).await?;
+    write_event(writer, &Event::AudioStop(AudioStopData::new())).await?;
 
     Ok(())
 }
@@ -522,7 +520,10 @@ async fn handle_ping<W>(writer: &mut W, data: PingData) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    write_event(writer, &Event::Pong(PongData { text: data.text })).await
+    let mut pong = PongData::new();
+    pong.text = data.text;
+    write_event(writer, &Event::Pong(pong)).await?;
+    Ok(())
 }
 
 /// Answer a `describe` event with service discovery info.
@@ -538,7 +539,8 @@ async fn handle_describe<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    write_event(writer, &Event::Info(build_info(runtime, voice_map))).await
+    write_event(writer, &Event::Info(build_info(runtime, voice_map))).await?;
+    Ok(())
 }
 
 /// Returns the Crane project attribution object used in Wyoming `info` responses.
@@ -606,11 +608,7 @@ fn build_info(runtime: &ModelRuntime, voice_map: &VoiceMap) -> InfoData {
         })
         .collect();
 
-    InfoData {
-        tts,
-        asr: vec![],
-        wake: vec![],
-    }
+    InfoData::new().with_tts(tts)
 }
 
 /// Send an `error` event with an optional machine-readable code.
@@ -618,14 +616,8 @@ async fn send_error<W>(writer: &mut W, text: &str, code: Option<&str>) -> Result
 where
     W: AsyncWrite + Unpin,
 {
-    write_event(
-        writer,
-        &Event::Error(ErrorData {
-            text: text.to_string(),
-            code: code.map(String::from),
-        }),
-    )
-    .await
+    write_event(writer, &Event::Error(error_data(text, code))).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -847,10 +839,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
-            vec![Event::Synthesize(SynthesizeData {
-                text: "hello".into(),
-                voice: None,
-            })],
+            vec![Event::Synthesize(SynthesizeData::new("hello"))],
         )
         .await;
 
@@ -892,14 +881,9 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
-            vec![Event::Synthesize(SynthesizeData {
-                text: "hi".into(),
-                voice: Some(SynthesizeVoice {
-                    name: Some("bob".into()),
-                    language: None,
-                    speaker: None,
-                }),
-            })],
+            vec![Event::Synthesize(
+                SynthesizeData::new("hi").with_voice(SynthesizeVoice::with_name("bob")),
+            )],
         )
         .await;
 
@@ -923,14 +907,9 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
-            vec![Event::Synthesize(SynthesizeData {
-                text: "hi".into(),
-                voice: Some(SynthesizeVoice {
-                    name: Some("ghost".into()),
-                    language: None,
-                    speaker: None,
-                }),
-            })],
+            vec![Event::Synthesize(
+                SynthesizeData::new("hi").with_voice(SynthesizeVoice::with_name("ghost")),
+            )],
         )
         .await;
 
@@ -948,15 +927,8 @@ mod tests {
         let rt = test_runtime();
         let vm = VoiceMap::new(&[], &rt);
 
-        let results = run_events(
-            &rt,
-            &vm,
-            vec![Event::Synthesize(SynthesizeData {
-                text: "hi".into(),
-                voice: None,
-            })],
-        )
-        .await;
+        let results =
+            run_events(&rt, &vm, vec![Event::Synthesize(SynthesizeData::new("hi"))]).await;
 
         assert_eq!(results.len(), 1);
         assert!(matches!(&results[0], Event::Error(_)));
@@ -969,15 +941,8 @@ mod tests {
             .unwrap();
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
-        let results = run_events(
-            &rt,
-            &vm,
-            vec![Event::Synthesize(SynthesizeData {
-                text: "hi".into(),
-                voice: None,
-            })],
-        )
-        .await;
+        let results =
+            run_events(&rt, &vm, vec![Event::Synthesize(SynthesizeData::new("hi"))]).await;
 
         assert_eq!(results.len(), 1);
         match &results[0] {
@@ -1000,10 +965,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
-            vec![Event::Synthesize(SynthesizeData {
-                text: "hello".into(),
-                voice: None,
-            })],
+            vec![Event::Synthesize(SynthesizeData::new("hello"))],
         )
         .await;
 
@@ -1038,10 +1000,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
-            vec![Event::Synthesize(SynthesizeData {
-                text: String::new(),
-                voice: None,
-            })],
+            vec![Event::Synthesize(SynthesizeData::new(String::new()))],
         )
         .await;
 
@@ -1069,10 +1028,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
-            vec![Event::Synthesize(SynthesizeData {
-                text: "hello".into(),
-                voice: None,
-            })],
+            vec![Event::Synthesize(SynthesizeData::new("hello"))],
         )
         .await;
 
@@ -1108,15 +1064,8 @@ mod tests {
         .unwrap();
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
-        let results = run_events(
-            &rt,
-            &vm,
-            vec![Event::Synthesize(SynthesizeData {
-                text: "hi".into(),
-                voice: None,
-            })],
-        )
-        .await;
+        let results =
+            run_events(&rt, &vm, vec![Event::Synthesize(SynthesizeData::new("hi"))]).await;
 
         assert_eq!(
             results.len(),
@@ -1137,21 +1086,9 @@ mod tests {
         let rt = test_runtime();
         let vm = VoiceMap::new(&[], &rt);
 
-        let results = run_events(
-            &rt,
-            &vm,
-            vec![Event::Ping(PingData {
-                text: Some("hi".into()),
-            })],
-        )
-        .await;
+        let results = run_events(&rt, &vm, vec![Event::Ping(PingData::with_text("hi"))]).await;
 
-        assert_eq!(
-            results,
-            vec![Event::Pong(PongData {
-                text: Some("hi".into())
-            })]
-        );
+        assert_eq!(results, vec![Event::Pong(PongData::with_text("hi"))]);
     }
 
     #[tokio::test]
@@ -1159,9 +1096,9 @@ mod tests {
         let rt = test_runtime();
         let vm = VoiceMap::new(&[], &rt);
 
-        let results = run_events(&rt, &vm, vec![Event::Ping(PingData { text: None })]).await;
+        let results = run_events(&rt, &vm, vec![Event::Ping(PingData::new())]).await;
 
-        assert_eq!(results, vec![Event::Pong(PongData { text: None })]);
+        assert_eq!(results, vec![Event::Pong(PongData::new())]);
     }
 
     #[tokio::test]
@@ -1394,36 +1331,19 @@ mod tests {
             &rt,
             &vm,
             vec![
-                Event::Ping(PingData {
-                    text: Some("a".into()),
-                }),
-                Event::Synthesize(SynthesizeData {
-                    text: "hi".into(),
-                    voice: None,
-                }),
-                Event::Ping(PingData {
-                    text: Some("b".into()),
-                }),
+                Event::Ping(PingData::with_text("a")),
+                Event::Synthesize(SynthesizeData::new("hi")),
+                Event::Ping(PingData::with_text("b")),
             ],
         )
         .await;
 
         assert_eq!(results.len(), 5);
-        assert_eq!(
-            results[0],
-            Event::Pong(PongData {
-                text: Some("a".into())
-            })
-        );
+        assert_eq!(results[0], Event::Pong(PongData::with_text("a")));
         assert!(matches!(results[1], Event::AudioStart(_)));
         assert!(matches!(results[2], Event::AudioChunk { .. }));
         assert!(matches!(results[3], Event::AudioStop(_)));
-        assert_eq!(
-            results[4],
-            Event::Pong(PongData {
-                text: Some("b".into())
-            })
-        );
+        assert_eq!(results[4], Event::Pong(PongData::with_text("b")));
     }
 
     #[test]
@@ -1500,15 +1420,8 @@ mod tests {
         .unwrap();
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
-        let results = run_events(
-            &rt,
-            &vm,
-            vec![Event::Synthesize(SynthesizeData {
-                text: "hi".into(),
-                voice: None,
-            })],
-        )
-        .await;
+        let results =
+            run_events(&rt, &vm, vec![Event::Synthesize(SynthesizeData::new("hi"))]).await;
 
         match &results[0] {
             Event::AudioStart(data) => assert_eq!(data.width, 2),

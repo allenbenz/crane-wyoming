@@ -5,12 +5,12 @@
 //! an optional extended-data JSON segment, and an optional binary
 //! payload segment.
 
-use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::event::Event;
+use crate::error::{IoStage, ProtocolError};
+use crate::event::{Event, to_json_vec};
 
 /// Protocol version string included in every outgoing header.
 ///
@@ -84,11 +84,11 @@ struct WriteHeader<'a> {
 ///
 /// Returns an error if JSON serialization of the header or data fails,
 /// or if the underlying writer returns an I/O error.
-pub async fn write_event<W>(writer: &mut W, event: &Event) -> Result<()>
+pub async fn write_event<W>(writer: &mut W, event: &Event) -> Result<(), ProtocolError>
 where
     W: AsyncWrite + Unpin,
 {
-    let data_bytes = event.serialize_data().context("serializing event data")?;
+    let data_bytes = event.serialize_data()?;
     let payload = event.payload();
 
     let header = WriteHeader {
@@ -97,23 +97,38 @@ where
         data_length: data_bytes.as_ref().map(Vec::len),
         payload_length: payload.map(<[u8]>::len),
     };
-    let mut header_bytes = serde_json::to_vec(&header).context("serializing event header")?;
+    let mut header_bytes = to_json_vec(&header)?;
     header_bytes.push(b'\n');
 
     writer
         .write_all(&header_bytes)
         .await
-        .context("writing event header")?;
+        .map_err(|e| ProtocolError::Io {
+            source: e,
+            stage: IoStage::WriteHeader,
+        })?;
     if let Some(data) = &data_bytes {
-        writer.write_all(data).await.context("writing event data")?;
+        writer
+            .write_all(data)
+            .await
+            .map_err(|e| ProtocolError::Io {
+                source: e,
+                stage: IoStage::WriteData,
+            })?;
     }
     if let Some(payload) = payload {
         writer
             .write_all(payload)
             .await
-            .context("writing event payload")?;
+            .map_err(|e| ProtocolError::Io {
+                source: e,
+                stage: IoStage::WritePayload,
+            })?;
     }
-    writer.flush().await.context("flushing event writer")?;
+    writer.flush().await.map_err(|e| ProtocolError::Io {
+        source: e,
+        stage: IoStage::Flush,
+    })?;
     Ok(())
 }
 
@@ -123,13 +138,20 @@ where
 ///
 /// Unlike [`AsyncBufReadExt::read_line`], this never grows `line`
 /// without bound in response to a peer that withholds the newline.
-async fn read_line_bounded<R>(reader: &mut R, line: &mut String, max_len: usize) -> Result<usize>
+async fn read_line_bounded<R>(
+    reader: &mut R,
+    line: &mut String,
+    max_len: usize,
+) -> Result<usize, ProtocolError>
 where
     R: AsyncBufRead + Unpin,
 {
     let mut buf = Vec::new();
     loop {
-        let available = reader.fill_buf().await.context("filling read buffer")?;
+        let available = reader.fill_buf().await.map_err(|e| ProtocolError::Io {
+            source: e,
+            stage: IoStage::ReadHeader,
+        })?;
         if available.is_empty() {
             break;
         }
@@ -142,16 +164,16 @@ where
         buf.extend_from_slice(available);
         reader.consume(consumed);
         if buf.len() > max_len {
-            bail!("header line exceeds maximum length of {max_len} bytes");
+            return Err(ProtocolError::HeaderTooLong { max: max_len });
         }
     }
     if buf.len() > max_len {
-        bail!("header line exceeds maximum length of {max_len} bytes");
+        return Err(ProtocolError::HeaderTooLong { max: max_len });
     }
 
     let bytes_read = buf.len();
     if bytes_read > 0 {
-        line.push_str(&String::from_utf8(buf).context("header line is not valid UTF-8")?);
+        line.push_str(&String::from_utf8(buf).map_err(ProtocolError::HeaderNotUtf8)?);
     }
     Ok(bytes_read)
 }
@@ -190,55 +212,67 @@ where
 /// inline or external `data` value is present but not a JSON object,
 /// or if `data` does not match the schema expected for a recognized
 /// event type.
-pub async fn read_event<R>(reader: &mut R) -> Result<Option<Event>>
+pub async fn read_event<R>(reader: &mut R) -> Result<Option<Event>, ProtocolError>
 where
     R: AsyncBufRead + Unpin,
 {
     let mut line = String::new();
-    let bytes_read = read_line_bounded(reader, &mut line, MAX_HEADER_LINE)
-        .await
-        .context("reading event header line")?;
+    let bytes_read = read_line_bounded(reader, &mut line, MAX_HEADER_LINE).await?;
     if bytes_read == 0 {
         return Ok(None);
     }
 
-    let header: Header = serde_json::from_str(line.trim_end()).context("parsing event header")?;
+    let header: Header =
+        serde_json::from_str(line.trim_end()).map_err(ProtocolError::HeaderInvalidJson)?;
 
     let mut merged_data = match header.data {
         Some(Value::Object(map)) => map,
-        Some(other) => bail!("expected inline event data to be a JSON object, got {other}"),
+        Some(other) => return Err(ProtocolError::NonObjectData(Box::new(other))),
         None => Map::new(),
     };
 
     if let Some(len) = header.data_length.filter(|&len| len > 0) {
         if len > MAX_DATA_LENGTH {
-            bail!("event data_length {len} exceeds maximum of {MAX_DATA_LENGTH}");
+            return Err(ProtocolError::DataLengthExceeded {
+                length: len,
+                max: MAX_DATA_LENGTH,
+            });
         }
         let mut buf = vec![0u8; len];
         reader
             .read_exact(&mut buf)
             .await
-            .context("reading event data segment")?;
-        let external: Value = serde_json::from_slice(&buf).context("parsing event data segment")?;
+            .map_err(|e| ProtocolError::Io {
+                source: e,
+                stage: IoStage::ReadData,
+            })?;
+        let external: Value =
+            serde_json::from_slice(&buf).map_err(ProtocolError::InvalidEventData)?;
         match external {
             Value::Object(external_map) => {
                 for (key, value) in external_map {
                     merged_data.insert(key, value);
                 }
             },
-            other => bail!("expected event data segment to be a JSON object, got {other}"),
+            other => return Err(ProtocolError::NonObjectData(Box::new(other))),
         }
     }
 
     let payload = if let Some(len) = header.payload_length.filter(|&len| len > 0) {
         if len > MAX_PAYLOAD_LENGTH {
-            bail!("event payload_length {len} exceeds maximum of {MAX_PAYLOAD_LENGTH}");
+            return Err(ProtocolError::PayloadLengthExceeded {
+                length: len,
+                max: MAX_PAYLOAD_LENGTH,
+            });
         }
         let mut buf = vec![0u8; len];
         reader
             .read_exact(&mut buf)
             .await
-            .context("reading event payload segment")?;
+            .map_err(|e| ProtocolError::Io {
+                source: e,
+                stage: IoStage::ReadPayload,
+            })?;
         Some(buf)
     } else {
         None

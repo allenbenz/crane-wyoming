@@ -5,11 +5,42 @@
 //! handles framing; this module handles the mapping between an event's
 //! `data` dict / binary payload and its typed Rust representation.
 
-use anyhow::Result;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+use crate::error::ProtocolError;
+
+/// Serializes `data` to JSON bytes, mapping the error to
+/// [`ProtocolError::Serialization`].
+pub(crate) fn to_json_vec(data: &impl Serialize) -> Result<Vec<u8>, ProtocolError> {
+    serde_json::to_vec(data).map_err(ProtocolError::Serialization)
+}
+
+/// Deserializes a JSON value into `T`, mapping the error to
+/// [`ProtocolError::InvalidEventData`].
+fn from_json_value<T: DeserializeOwned>(data: serde_json::Value) -> Result<T, ProtocolError> {
+    serde_json::from_value(data).map_err(ProtocolError::InvalidEventData)
+}
+
+/// PCM audio sample format shared by `audio-start` and `audio-chunk` events.
+///
+/// Groups the three fields that describe an audio format into a single
+/// struct with named fields, so constructing [`AudioStartData`] or
+/// [`AudioChunkData`] cannot accidentally transpose `width` and
+/// `channels` (both `u16`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioFormat {
+    /// Sample rate in Hz (e.g. 22050, 24000).
+    pub rate: u32,
+    /// Sample width in bytes (e.g. 2 for 16-bit PCM).
+    pub width: u16,
+    /// Number of audio channels (1 = mono).
+    pub channels: u16,
+}
 
 /// Data for an `audio-start` event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AudioStartData {
     /// Sample rate in Hz (e.g. 22050, 24000).
     pub rate: u32,
@@ -22,11 +53,27 @@ pub struct AudioStartData {
     pub timestamp: Option<u64>,
 }
 
+impl AudioStartData {
+    /// Creates a new `AudioStartData` with the given audio format.
+    ///
+    /// Optional fields (`timestamp`) default to `None`.
+    #[must_use]
+    pub fn new(format: AudioFormat) -> Self {
+        Self {
+            rate: format.rate,
+            width: format.width,
+            channels: format.channels,
+            timestamp: None,
+        }
+    }
+}
+
 /// Data for an `audio-chunk` event.
 ///
 /// The raw PCM bytes are carried in the event's binary payload, not in
 /// this struct.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AudioChunkData {
     /// Sample rate in Hz.
     pub rate: u32,
@@ -39,16 +86,41 @@ pub struct AudioChunkData {
     pub timestamp: Option<u64>,
 }
 
+impl AudioChunkData {
+    /// Creates a new `AudioChunkData` with the given audio format.
+    ///
+    /// Optional fields (`timestamp`) default to `None`.
+    #[must_use]
+    pub fn new(format: AudioFormat) -> Self {
+        Self {
+            rate: format.rate,
+            width: format.width,
+            channels: format.channels,
+            timestamp: None,
+        }
+    }
+}
+
 /// Data for an `audio-stop` event.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AudioStopData {
     /// Optional timestamp in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<u64>,
 }
 
+impl AudioStopData {
+    /// Creates a new `AudioStopData` with no timestamp.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Voice specification carried in a `synthesize` event.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SynthesizeVoice {
     /// Voice name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,8 +133,26 @@ pub struct SynthesizeVoice {
     pub speaker: Option<String>,
 }
 
+impl SynthesizeVoice {
+    /// Creates a new `SynthesizeVoice` with all fields unset.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a `SynthesizeVoice` with the given voice name.
+    #[must_use]
+    pub fn with_name(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            ..Self::default()
+        }
+    }
+}
+
 /// Data for a `synthesize` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SynthesizeData {
     /// Text to synthesize.
     pub text: String,
@@ -71,30 +161,101 @@ pub struct SynthesizeData {
     pub voice: Option<SynthesizeVoice>,
 }
 
+impl SynthesizeData {
+    /// Creates a new `SynthesizeData` with the given text and no voice.
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            voice: None,
+        }
+    }
+
+    /// Sets the voice specification for this synthesize request.
+    #[must_use]
+    pub fn with_voice(mut self, voice: SynthesizeVoice) -> Self {
+        self.voice = Some(voice);
+        self
+    }
+}
+
 /// Data for a `ping` event.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PingData {
     /// Optional text to echo back in the `pong` response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
 }
 
+impl PingData {
+    /// Creates a new `PingData` with no text.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a `PingData` with the given text.
+    #[must_use]
+    pub fn with_text(text: impl Into<String>) -> Self {
+        Self {
+            text: Some(text.into()),
+        }
+    }
+}
+
 /// Data for a `pong` event.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PongData {
     /// Text echoed from the `ping` request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
 }
 
+impl PongData {
+    /// Creates a new `PongData` with no text.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a `PongData` with the given text.
+    #[must_use]
+    pub fn with_text(text: impl Into<String>) -> Self {
+        Self {
+            text: Some(text.into()),
+        }
+    }
+}
+
 /// Data for an `error` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ErrorData {
     /// Human-readable error message.
     pub text: String,
     /// Optional machine-readable error code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+}
+
+impl ErrorData {
+    /// Creates a new `ErrorData` with the given message and no error code.
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            code: None,
+        }
+    }
+
+    /// Sets the machine-readable error code.
+    #[must_use]
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
+    }
 }
 
 /// Data for an `info` event (service discovery response).
@@ -105,6 +266,7 @@ pub struct ErrorData {
 /// discovery responses. Typed builders belong to a later step; this
 /// type just needs to round-trip the wire format faithfully.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct InfoData {
     /// TTS service descriptors.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -115,6 +277,21 @@ pub struct InfoData {
     /// Wake word service descriptors.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wake: Vec<serde_json::Value>,
+}
+
+impl InfoData {
+    /// Creates a new `InfoData` with empty service descriptor lists.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the TTS service descriptors.
+    #[must_use]
+    pub fn with_tts(mut self, tts: Vec<serde_json::Value>) -> Self {
+        self.tts = tts;
+        self
+    }
 }
 
 /// A Wyoming protocol event.
@@ -211,22 +388,22 @@ impl Event {
     /// # Errors
     ///
     /// Returns an error if JSON serialization fails.
-    pub(crate) fn serialize_data(&self) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn serialize_data(&self) -> Result<Option<Vec<u8>>, ProtocolError> {
         let value = match self {
-            Event::AudioStart(data) => Some(serde_json::to_vec(data)?),
-            Event::AudioChunk { data, .. } => Some(serde_json::to_vec(data)?),
-            Event::AudioStop(data) => Some(serde_json::to_vec(data)?),
-            Event::Synthesize(data) => Some(serde_json::to_vec(data)?),
+            Event::AudioStart(data) => Some(to_json_vec(data)?),
+            Event::AudioChunk { data, .. } => Some(to_json_vec(data)?),
+            Event::AudioStop(data) => Some(to_json_vec(data)?),
+            Event::Synthesize(data) => Some(to_json_vec(data)?),
             Event::Describe => None,
-            Event::Info(data) => Some(serde_json::to_vec(data)?),
-            Event::Ping(data) => Some(serde_json::to_vec(data)?),
-            Event::Pong(data) => Some(serde_json::to_vec(data)?),
-            Event::Error(data) => Some(serde_json::to_vec(data)?),
+            Event::Info(data) => Some(to_json_vec(data)?),
+            Event::Ping(data) => Some(to_json_vec(data)?),
+            Event::Pong(data) => Some(to_json_vec(data)?),
+            Event::Error(data) => Some(to_json_vec(data)?),
             Event::Unknown { data, .. } => {
                 if data.is_null() {
                     None
                 } else {
-                    Some(serde_json::to_vec(data)?)
+                    Some(to_json_vec(data)?)
                 }
             },
         };
@@ -261,7 +438,7 @@ impl Event {
         event_type: &str,
         data: serde_json::Value,
         payload: Option<Vec<u8>>,
-    ) -> Result<Self> {
+    ) -> Result<Self, ProtocolError> {
         // No data segment on the wire (or an explicit `null`) means "no
         // fields set", equivalent to an empty object -- not the absence
         // of a valid data value. Structs whose fields are all optional
@@ -272,18 +449,18 @@ impl Event {
             data
         };
         Ok(match event_type {
-            TYPE_AUDIO_START => Event::AudioStart(serde_json::from_value(data)?),
+            TYPE_AUDIO_START => Event::AudioStart(from_json_value(data)?),
             TYPE_AUDIO_CHUNK => Event::AudioChunk {
-                data: serde_json::from_value(data)?,
+                data: from_json_value(data)?,
                 audio: payload.unwrap_or_default(),
             },
-            TYPE_AUDIO_STOP => Event::AudioStop(serde_json::from_value(data)?),
-            TYPE_SYNTHESIZE => Event::Synthesize(serde_json::from_value(data)?),
+            TYPE_AUDIO_STOP => Event::AudioStop(from_json_value(data)?),
+            TYPE_SYNTHESIZE => Event::Synthesize(from_json_value(data)?),
             TYPE_DESCRIBE => Event::Describe,
-            TYPE_INFO => Event::Info(serde_json::from_value(data)?),
-            TYPE_PING => Event::Ping(serde_json::from_value(data)?),
-            TYPE_PONG => Event::Pong(serde_json::from_value(data)?),
-            TYPE_ERROR => Event::Error(serde_json::from_value(data)?),
+            TYPE_INFO => Event::Info(from_json_value(data)?),
+            TYPE_PING => Event::Ping(from_json_value(data)?),
+            TYPE_PONG => Event::Pong(from_json_value(data)?),
+            TYPE_ERROR => Event::Error(from_json_value(data)?),
             other => Event::Unknown {
                 event_type: other.to_string(),
                 data,

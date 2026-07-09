@@ -14,6 +14,7 @@ pub mod engine;
 pub mod handler;
 
 pub use handler::{VoiceMap, handle_connection};
+pub use wyoming_protocol::error::ProtocolError;
 pub use wyoming_protocol::event::Event;
 pub use wyoming_protocol::wire::{
     MAX_DATA_LENGTH, MAX_HEADER_LINE, MAX_PAYLOAD_LENGTH, read_event, write_event,
@@ -596,14 +597,9 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut reader = tokio::io::BufReader::new(reader);
 
-        write_event(
-            &mut writer,
-            &Event::Ping(PingData {
-                text: Some("hi".into()),
-            }),
-        )
-        .await
-        .unwrap();
+        write_event(&mut writer, &Event::Ping(PingData::with_text("hi")))
+            .await
+            .unwrap();
 
         let response = read_event(&mut reader).await.unwrap().unwrap();
         match response {
@@ -634,15 +630,9 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut reader = tokio::io::BufReader::new(reader);
 
-        write_event(
-            &mut writer,
-            &Event::Synthesize(SynthesizeData {
-                text: "hi".into(),
-                voice: None,
-            }),
-        )
-        .await
-        .unwrap();
+        write_event(&mut writer, &Event::Synthesize(SynthesizeData::new("hi")))
+            .await
+            .unwrap();
 
         let start = read_event(&mut reader).await.unwrap().unwrap();
         match start {
@@ -812,14 +802,9 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut reader = tokio::io::BufReader::new(reader);
 
-        write_event(
-            &mut writer,
-            &Event::Ping(PingData {
-                text: Some("hi".into()),
-            }),
-        )
-        .await
-        .unwrap();
+        write_event(&mut writer, &Event::Ping(PingData::with_text("hi")))
+            .await
+            .unwrap();
 
         let response = read_event(&mut reader).await.unwrap().unwrap();
         match response {

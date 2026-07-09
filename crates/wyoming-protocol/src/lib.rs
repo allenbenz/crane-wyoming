@@ -20,15 +20,27 @@
 //! The protocol is symmetric: both client and server use the same
 //! framing.
 //!
+//! # Event scope
+//!
+//! This crate intentionally models only the subset of Wyoming events
+//! needed for TTS service integration: `synthesize`, `audio-start`,
+//! `audio-chunk`, `audio-stop`, `describe`/`info`, `ping`/`pong`, and
+//! `error`. ASR, wake-word, and intent events are not included.
+//! Unrecognized event types are preserved as [`Event::Unknown`] for
+//! forward compatibility.
+//!
 //! # Module layout
 //!
 //! | Module  | Responsibility                                    |
 //! |---------|----------------------------------------------------|
+//! | `error` | `ProtocolError` type for wire protocol failures    |
 //! | `event` | Typed event enum and per-event data structs        |
 //! | `wire`  | Async read/write functions for the wire protocol   |
 
+pub mod error;
 pub mod event;
 pub mod wire;
 
-pub use event::Event;
+pub use error::{IoStage, ProtocolError};
+pub use event::{AudioFormat, Event};
 pub use wire::{MAX_DATA_LENGTH, MAX_HEADER_LINE, MAX_PAYLOAD_LENGTH, read_event, write_event};
