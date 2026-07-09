@@ -1,0 +1,19 @@
+[package]
+name = "cw-say"
+version = "0.1.0"
+description = "Wyoming protocol TTS CLI client"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/cryptomilk/crane-wyoming"
+authors = ["Andreas Schneider <asn@cryptomilk.org>"]
+
+[lib]
+name = "cw_say"
+path = "src/lib.rs"
+
+[dependencies]
+wyoming-protocol = { path = "../wyoming-protocol" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
