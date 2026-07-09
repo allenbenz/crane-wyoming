@@ -288,8 +288,11 @@ where
 }
 
 /// Close an in-progress audio stream with `audio-stop`, then report `text`
-/// as an `error` event -- the mid-stream error convention documented in
-/// WYOMING.md.
+/// as an `error` event -- crane-wyoming's own mid-stream error convention.
+/// The Wyoming protocol spec does not define `error`'s relationship to
+/// `audio-stop` at all, so this ordering is not something a generic
+/// Wyoming client can assume; [`wyoming_protocol::client::Client`] is the
+/// one client expected to rely on it.
 async fn stop_stream_with_error<W>(writer: &mut W, text: &str) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -384,9 +387,10 @@ where
 /// not an error -- it is reported as an empty `audio-start`/`audio-stop`
 /// pair. A failure after the first chunk (including a chunk that fails to
 /// encode) closes the in-progress stream with `audio-stop` before sending
-/// the `error` event, per the mid-stream error convention documented in
-/// WYOMING.md. Every write to the client uses [`WRITE_TIMEOUT`], since a
-/// stalled write here blocks the model's shared worker thread.
+/// the `error` event, per crane-wyoming's own mid-stream error convention
+/// (see [`stop_stream_with_error`]) -- not something the Wyoming protocol
+/// spec itself defines. Every write to the client uses [`WRITE_TIMEOUT`],
+/// since a stalled write here blocks the model's shared worker thread.
 async fn handle_synthesize_streaming<W>(
     writer: &mut W,
     runtime: &ModelRuntime,

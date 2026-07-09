@@ -478,7 +478,9 @@ mod tests {
     use candle_core::{Device, Tensor};
     use crane::audio::tts::{AudioInfo, Tts, VoiceInfo, pcm_f32_to_i16};
     use crane_core::generation::SpeechOptions;
+    use std::ops::ControlFlow;
     use tokio::net::{TcpListener, TcpStream};
+    use wyoming_protocol::client::{Client, ClientError};
     use wyoming_protocol::event::{PingData, SynthesizeData};
 
     #[test]
@@ -654,6 +656,169 @@ mod tests {
 
         let stop = read_event(&mut reader).await.unwrap().unwrap();
         assert!(matches!(stop, Event::AudioStop(_)));
+    }
+
+    #[tokio::test]
+    async fn test_client_ping() {
+        let rt = test_runtime();
+        let vm = VoiceMap::new(&[], &rt);
+        let addr = spawn_test_server(rt, vm).await;
+
+        let mut client = Client::connect(&format!("tcp://{addr}")).await.unwrap();
+        let pong = client.ping(PingData::with_text("hi")).await.unwrap();
+        assert_eq!(pong.text.as_deref(), Some("hi"));
+    }
+
+    #[tokio::test]
+    async fn test_client_describe() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "m1".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(
+                24000,
+                vec![VoiceInfo {
+                    name: "alice".into(),
+                    languages: vec!["en".into()],
+                }],
+            )),
+        )
+        .unwrap();
+        let vm = VoiceMap::new(&["m1".to_string()], &rt);
+        let addr = spawn_test_server(rt, vm).await;
+
+        let mut client = Client::connect(&format!("tcp://{addr}")).await.unwrap();
+        let info = client.describe().await.unwrap();
+        assert!(!info.tts.is_empty());
+        let voices = info.tts[0].get("voices").unwrap().as_array().unwrap();
+        assert!(voices.iter().any(|v| v.get("name").unwrap() == "alice"));
+    }
+
+    #[tokio::test]
+    async fn test_client_synthesize() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "m1".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(
+                24000,
+                vec![VoiceInfo {
+                    name: "alice".into(),
+                    languages: vec!["en".into()],
+                }],
+            )),
+        )
+        .unwrap();
+        let vm = VoiceMap::new(&["m1".to_string()], &rt);
+        let addr = spawn_test_server(rt, vm).await;
+
+        let mut client = Client::connect(&format!("tcp://{addr}")).await.unwrap();
+        let response = client.synthesize(SynthesizeData::new("hi")).await.unwrap();
+        assert_eq!(response.format.rate, 24000);
+        assert_eq!(response.format.width, 2);
+        assert_eq!(response.format.channels, 1);
+        assert_eq!(response.audio, pcm_f32_to_i16(&[0.5f32; 2]));
+    }
+
+    #[tokio::test]
+    async fn test_client_synthesize_streaming() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "m1".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(
+                24000,
+                vec![VoiceInfo {
+                    name: "alice".into(),
+                    languages: vec!["en".into()],
+                }],
+            )),
+        )
+        .unwrap();
+        let vm = VoiceMap::new(&["m1".to_string()], &rt);
+        let addr = spawn_test_server(rt, vm).await;
+
+        let mut client = Client::connect(&format!("tcp://{addr}")).await.unwrap();
+        let mut total_bytes = 0usize;
+        let mut chunk_count = 0usize;
+        let format = client
+            .synthesize_streaming(SynthesizeData::new("hi"), |chunk, _format| {
+                total_bytes += chunk.len();
+                chunk_count += 1;
+                ControlFlow::Continue(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(format.rate, 24000);
+        assert!(chunk_count > 0);
+        assert_eq!(total_bytes, pcm_f32_to_i16(&[0.5f32; 2]).len());
+    }
+
+    #[tokio::test]
+    async fn test_client_synthesize_error() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "m1".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(
+                24000,
+                vec![VoiceInfo {
+                    name: "alice".into(),
+                    languages: vec!["en".into()],
+                }],
+            )),
+        )
+        .unwrap();
+        let vm = VoiceMap::new(&["m1".to_string()], &rt);
+        let addr = spawn_test_server(rt, vm).await;
+
+        let mut client = Client::connect(&format!("tcp://{addr}")).await.unwrap();
+        let request = SynthesizeData::new("hi")
+            .with_voice(wyoming_protocol::event::SynthesizeVoice::with_name("ghost"));
+        let err = client.synthesize(request).await.unwrap_err();
+        match err {
+            ClientError::ServerError { code, .. } => {
+                assert_eq!(code.as_deref(), Some("voice-not-found"));
+            },
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_client_synthesize_streaming_break() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "m1".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(
+                24000,
+                vec![VoiceInfo {
+                    name: "alice".into(),
+                    languages: vec!["en".into()],
+                }],
+            )),
+        )
+        .unwrap();
+        let vm = VoiceMap::new(&["m1".to_string()], &rt);
+        let addr = spawn_test_server(rt, vm).await;
+
+        let mut client = Client::connect(&format!("tcp://{addr}")).await.unwrap();
+        let mut chunk_count = 0usize;
+        let result = client
+            .synthesize_streaming(SynthesizeData::new("hi"), |_chunk, _format| {
+                chunk_count += 1;
+                ControlFlow::Break(())
+            })
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(chunk_count, 1);
+
+        // The connection must still be usable for a subsequent request.
+        let pong = client
+            .ping(PingData::with_text("still alive"))
+            .await
+            .unwrap();
+        assert_eq!(pong.text.as_deref(), Some("still alive"));
     }
 
     fn args_with_uri(uri: &str) -> Args {

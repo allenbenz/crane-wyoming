@@ -31,16 +31,19 @@
 //!
 //! # Module layout
 //!
-//! | Module  | Responsibility                                    |
-//! |---------|----------------------------------------------------|
-//! | `error` | `ProtocolError` type for wire protocol failures    |
-//! | `event` | Typed event enum and per-event data structs        |
-//! | `wire`  | Async read/write functions for the wire protocol   |
+//! | Module   | Responsibility                                    |
+//! |----------|----------------------------------------------------|
+//! | `error`  | `ProtocolError` type for wire protocol failures    |
+//! | `event`  | Typed event enum and per-event data structs        |
+//! | `wire`   | Async read/write functions for the wire protocol   |
+//! | `client` | Async client for connecting to a Wyoming server    |
 
+pub mod client;
 pub mod error;
 pub mod event;
 pub mod wire;
 
+pub use client::{Client, ClientError, SynthesizeResponse};
 pub use error::{IoStage, ProtocolError};
 pub use event::{AudioFormat, Event};
 pub use wire::{MAX_DATA_LENGTH, MAX_HEADER_LINE, MAX_PAYLOAD_LENGTH, read_event, write_event};

@@ -11,7 +11,7 @@ authors = ["Andreas Schneider <asn@cryptomilk.org>"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util"] }
+tokio = { version = "1", features = ["io-util", "net", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
