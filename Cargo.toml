@@ -24,8 +24,8 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 crane = { git = "https://github.com/lucasjinreal/Crane", branch = "main" }
 crane-core = { git = "https://github.com/lucasjinreal/Crane", branch = "main" }
-# Must match the candle-core version
-candle-core = "0.10.2"
+# Keep in sync with Crane
+candle-core = "0.11"
 
 [dev-dependencies]
 tempfile = "3"
