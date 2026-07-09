@@ -19,11 +19,11 @@ use crate::engine::{ModelRuntime, TtsGenerateRequest, TtsHandle};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::oneshot;
 
-use crate::event::{
+use wyoming_protocol::event::{
     AudioChunkData, AudioStartData, AudioStopData, ErrorData, Event, InfoData, PingData, PongData,
     SynthesizeData,
 };
-use crate::wire::{read_event, write_event};
+use wyoming_protocol::wire::{read_event, write_event};
 
 /// Maps voice names to TTS model registration names.
 ///
@@ -631,11 +631,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::SynthesizeVoice;
     use candle_core::{Device, Tensor};
     use crane::audio::tts::{AudioInfo, Tts, TtsStream, VoiceInfo};
     use std::io::Cursor as SyncCursor;
     use tokio::io::BufReader;
+    use wyoming_protocol::event::SynthesizeVoice;
 
     struct MockTts {
         audio_info: AudioInfo,

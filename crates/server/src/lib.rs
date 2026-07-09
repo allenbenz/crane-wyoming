@@ -1,42 +1,23 @@
-//! Wyoming protocol wire format for Crane.
-//!
-//! Implements the JSONL + binary framing used by the
-//! [Wyoming protocol](https://github.com/rhasspy/wyoming) for
-//! Home Assistant voice integration. This crate handles serialization
-//! and deserialization of Wyoming events over async byte streams
-//! (`tokio::io::AsyncRead` / `AsyncWrite`).
-//!
-//! # Wire format
-//!
-//! Each message consists of three parts:
-//!
-//! 1. **JSON header line** (newline-terminated) -- type, version,
-//!    `data_length`, `payload_length`
-//! 2. **Extended data** (`data_length` bytes) -- UTF-8 JSON of the
-//!    event's data dict
-//! 3. **Binary payload** (`payload_length` bytes) -- raw bytes (PCM
-//!    audio for `audio-chunk` events)
-//!
-//! The protocol is symmetric: both client and server use the same
-//! framing.
+//! Wyoming protocol TTS server for Home Assistant voice integration.
 //!
 //! # Module layout
 //!
 //! | Module    | Responsibility                                       |
 //! |-----------|-------------------------------------------------------|
 //! | `engine`  | `ModelRuntime` -- owns and dispatches to TTS models   |
-//! | `event`   | Typed event enum and per-event data structs           |
-//! | `wire`    | Async read/write functions for the wire protocol      |
 //! | `handler` | TTS event handling, dispatching to `ModelRuntime`     |
+//!
+//! The wire protocol types (`Event`, `read_event`, `write_event`) are
+//! implemented in and re-exported from the [`wyoming_protocol`] crate.
 
 pub mod engine;
-pub mod event;
 pub mod handler;
-pub mod wire;
 
-pub use event::Event;
 pub use handler::{VoiceMap, handle_connection};
-pub use wire::{MAX_DATA_LENGTH, MAX_HEADER_LINE, MAX_PAYLOAD_LENGTH, read_event, write_event};
+pub use wyoming_protocol::event::Event;
+pub use wyoming_protocol::wire::{
+    MAX_DATA_LENGTH, MAX_HEADER_LINE, MAX_PAYLOAD_LENGTH, read_event, write_event,
+};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -493,11 +474,11 @@ async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{PingData, SynthesizeData};
     use candle_core::{Device, Tensor};
     use crane::audio::tts::{AudioInfo, Tts, VoiceInfo, pcm_f32_to_i16};
     use crane_core::generation::SpeechOptions;
     use tokio::net::{TcpListener, TcpStream};
+    use wyoming_protocol::event::{PingData, SynthesizeData};
 
     #[test]
     fn parse_size_bare_bytes() {
