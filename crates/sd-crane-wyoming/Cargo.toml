@@ -1,0 +1,22 @@
+[package]
+name = "sd-crane-wyoming"
+version = "0.1.0"
+description = "speech-dispatcher output module for crane-wyoming"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/cryptomilk/crane-wyoming"
+authors = ["Andreas Schneider <asn@cryptomilk.org>"]
+
+[lib]
+name = "sd_crane_wyoming"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sd_crane_wyoming"
+path = "src/main.rs"
+
+[dependencies]
+wyoming-protocol = { path = "../wyoming-protocol" }
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "net", "io-util"] }
