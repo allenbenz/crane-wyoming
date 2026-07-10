@@ -7,7 +7,9 @@
 
 # Required: one or more TTS model directories, separated by ';'.
 # The first path is the default voice when a client does not request one.
-#CRANE_WYOMING_MODEL_PATH=~/.local/share/inference-models/Voxtral-4B-TTS-2603;~/.local/share/inference-models/Qwen3-TTS
+# Use absolute paths: EnvironmentFile= does not do shell-style expansion,
+# so '~' or '$HOME' are passed through literally instead of being resolved.
+#CRANE_WYOMING_MODEL_PATH=/home/user/.local/share/inference-models/Voxtral-4B-TTS-2603
 
 # TCP port to listen on (default: 10200).
 #CRANE_WYOMING_PORT=10200
@@ -28,7 +30,8 @@
 #CRANE_WYOMING_MAX_CONNECTIONS=16
 
 # Directory for the on-disk TTS response cache. Omit to disable caching.
-#CRANE_WYOMING_TTS_CACHE_DIR=~/.cache/crane-wyoming
+# Use an absolute path (see note on CRANE_WYOMING_MODEL_PATH above).
+#CRANE_WYOMING_TTS_CACHE_DIR=/home/user/.cache/crane-wyoming
 
 # Maximum size of the TTS cache, e.g. "500M" or "1G" (default: 500M).
 #CRANE_WYOMING_TTS_CACHE_MAX_SIZE=500M
