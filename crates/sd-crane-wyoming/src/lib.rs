@@ -230,6 +230,56 @@ fn read_text_block(
     Ok(None)
 }
 
+/// Strips the SSML markup speechd wraps every message in before sending
+/// `SPEAK`.
+///
+/// speechd's `insert_index_marks()` always wraps outgoing text in
+/// `<speak>...</speak>` and escapes literal `<`/`>`/`&` as entities,
+/// regardless of `SSML_MODE` — output modules with no native SSML support
+/// are expected to strip it back out themselves, exactly as speechd's own
+/// `module_strip_ssml()` (`module_utils.c`) does: text between `<` and `>`
+/// is dropped (this also removes any `<mark name="N"/>` index marks, since
+/// they're just another tag), and `&lt;`/`&gt;`/`&amp;`/`&quot;`/`&apos;`
+/// are unescaped. As in `module_strip_ssml()`, a stray `>` with no prior
+/// `<` is dropped, and an unterminated `<` discards the rest of the text.
+fn strip_ssml(text: &str) -> String {
+    const ENTITIES: [(&str, char); 5] = [
+        ("&lt;", '<'),
+        ("&gt;", '>'),
+        ("&amp;", '&'),
+        ("&quot;", '"'),
+        ("&apos;", '\''),
+    ];
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut omit = false;
+    while let Some(c) = rest.chars().next() {
+        if c == '<' {
+            omit = true;
+            rest = &rest[1..];
+            continue;
+        }
+        if c == '>' {
+            omit = false;
+            rest = &rest[1..];
+            continue;
+        }
+        if !omit {
+            if let Some((entity, unescaped)) =
+                ENTITIES.iter().find(|(entity, _)| rest.starts_with(entity))
+            {
+                out.push(*unescaped);
+                rest = &rest[entity.len()..];
+                continue;
+            }
+            out.push(c);
+        }
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
 /// Connects to the Wyoming server at `uri`, confirms it responds to
 /// `describe`, and returns its voice list for `LIST VOICES` to serve
 /// later.
@@ -844,6 +894,7 @@ pub fn run(
                 let Some(text) = read_text_block(&mut lines)? else {
                     break;
                 };
+                let text = strip_ssml(&text);
                 if text.is_empty() {
                     write_reply(&mut output, "301 ERROR CANT SPEAK\n")?;
                     continue;
@@ -1507,6 +1558,62 @@ mod tests {
             read_text_block(&mut lines).unwrap(),
             Some("\nfoo".to_string())
         );
+    }
+
+    #[test]
+    fn strip_ssml_removes_speak_wrapper() {
+        assert_eq!(strip_ssml("<speak>hello world</speak>"), "hello world");
+    }
+
+    #[test]
+    fn strip_ssml_removes_index_marks() {
+        assert_eq!(
+            strip_ssml("<speak>one<mark name=\"1\"/>two</speak>"),
+            "onetwo"
+        );
+    }
+
+    #[test]
+    fn strip_ssml_unescapes_entities() {
+        assert_eq!(
+            strip_ssml("&lt;3 &amp; &quot;stuff&quot; &apos;n&apos; &gt;more"),
+            "<3 & \"stuff\" 'n' >more"
+        );
+    }
+
+    #[test]
+    fn strip_ssml_passes_through_plain_text() {
+        assert_eq!(strip_ssml("hätt ich Kuchen da"), "hätt ich Kuchen da");
+    }
+
+    #[test]
+    fn strip_ssml_entities_inside_tag_are_dropped() {
+        assert_eq!(strip_ssml("<foo a=\"x&amp;y\">bar</foo>"), "bar");
+    }
+
+    #[test]
+    fn strip_ssml_unterminated_tag_discards_tail() {
+        assert_eq!(strip_ssml("hello<oops"), "hello");
+    }
+
+    #[test]
+    fn strip_ssml_stray_gt_is_dropped() {
+        assert_eq!(strip_ssml("a>b"), "ab");
+    }
+
+    #[test]
+    fn strip_ssml_bare_ampersand_passes_through() {
+        assert_eq!(strip_ssml("cats & dogs"), "cats & dogs");
+    }
+
+    #[test]
+    fn strip_ssml_empty_string() {
+        assert_eq!(strip_ssml(""), "");
+    }
+
+    #[test]
+    fn strip_ssml_truncated_entity_passes_through() {
+        assert_eq!(strip_ssml("abc&am"), "abc&am");
     }
 
     #[test]
