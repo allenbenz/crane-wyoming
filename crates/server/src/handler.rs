@@ -388,7 +388,16 @@ where
         VoiceResolution::Found {
             model_name,
             voice_name,
-        } => (model_name, voice_name),
+        } => {
+            tracing::debug!(
+                requested_voice = ?data.voice.as_ref().and_then(|v| v.name.as_deref()),
+                requested_language = ?data.voice.as_ref().and_then(|v| v.language.as_deref()),
+                resolved_model = %model_name,
+                resolved_voice = ?voice_name,
+                "Resolved synthesize voice",
+            );
+            (model_name, voice_name)
+        },
         VoiceResolution::NotFound(voice_name) => {
             tracing::warn!(voice = %voice_name, "Voice not found");
             return send_error(

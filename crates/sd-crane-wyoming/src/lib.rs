@@ -852,7 +852,12 @@ pub fn run(
                     write_reply(&mut output, "301 ERROR CANT SPEAK\n")?;
                     continue;
                 };
-                tracing::debug!("synthesizing {} byte(s) of text", text.len());
+                tracing::debug!(
+                    synthesis_voice = ?settings.synthesis_voice,
+                    language = ?settings.language,
+                    text = %text,
+                    "synthesizing text",
+                );
                 let rt = runtime_handle(&mut runtime)?;
                 let mut poll_interrupt = || interrupt_fd.and_then(poll_fd_interrupt);
                 speak(
