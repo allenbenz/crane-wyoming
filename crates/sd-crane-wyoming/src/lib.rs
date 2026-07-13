@@ -5,15 +5,18 @@
 //! protocol. Internally it is a Wyoming client to a running
 //! `crane-wyoming` server. `INIT` connects, calls `describe`, and caches
 //! the resulting voice list; `SET` stores per-utterance settings for a
-//! later `SPEAK`; `LIST VOICES` answers from the cached list; `QUIT`
-//! disconnects; anything else is rejected as unknown. Later steps add
-//! `SPEAK` and `STOP`/`PAUSE`.
+//! later `SPEAK`; `AUDIO` accepts server-side audio output; `SPEAK`
+//! synthesizes text and streams it back as `705 AUDIO` events;
+//! `LIST VOICES` answers from the cached list; `QUIT` disconnects;
+//! anything else is rejected as unknown. A later step adds
+//! `STOP`/`PAUSE`.
 
 use std::io::{self, BufRead, Write};
+use std::ops::ControlFlow;
 
 use anyhow::Context;
-use wyoming_protocol::event::InfoData;
-use wyoming_protocol::{Client, ClientError};
+use wyoming_protocol::event::{InfoData, SynthesizeData, SynthesizeVoice};
+use wyoming_protocol::{AudioFormat, Client, ClientError};
 
 /// A voice offered by the connected Wyoming server, as reported by
 /// `describe` and cached at `INIT` time for `LIST VOICES`.
@@ -100,6 +103,83 @@ fn write_reply(output: &mut impl Write, reply: &str) -> io::Result<()> {
     output.flush()
 }
 
+/// HDLC-escapes PCM bytes for speechd's `705 AUDIO` wire format.
+///
+/// The `705 AUDIO` line is terminated by `\n`, so any `\n` byte in the
+/// raw PCM data must not appear literally; the escape byte itself
+/// (`0x7d`) needs the same treatment so decoding is unambiguous. Each
+/// occurrence of `0x7d` or `0x0a` is replaced with `0x7d` followed by
+/// the byte XOR'd with `0x20`, matching speechd's own
+/// `module_tts_output_send_server` in `module_process.c`.
+fn hdlc_escape(pcm: &[u8]) -> Vec<u8> {
+    let mut escaped = Vec::with_capacity(pcm.len());
+    for &byte in pcm {
+        if byte == 0x7d || byte == 0x0a {
+            escaped.push(0x7d);
+            escaped.push(byte ^ 0x20);
+        } else {
+            escaped.push(byte);
+        }
+    }
+    escaped
+}
+
+/// Maximum PCM bytes carried by a single `705 AUDIO` event, matching
+/// speechd's own `MAX_CHUNK` in `module_process.c` — large enough for
+/// efficient transfer, small enough to stay reactive to `STOP`.
+const MAX_CHUNK: usize = 10_000;
+
+/// Writes one `705 AUDIO` event carrying `pcm` (at most [`MAX_CHUNK`]
+/// bytes; callers split larger buffers before calling this).
+///
+/// `format` supplies the header fields; `pcm` is HDLC-escaped and
+/// framed as `705-AUDIO\0{escaped}\n705 AUDIO\n`, the wire format
+/// speechd's server (`output.c`) expects for server-side audio output.
+fn write_audio_event(output: &mut impl Write, format: AudioFormat, pcm: &[u8]) -> io::Result<()> {
+    let sample_size = usize::from(format.channels) * usize::from(format.width);
+    debug_assert!(sample_size != 0, "zero-width or zero-channel audio format");
+    debug_assert!(
+        pcm.len().is_multiple_of(sample_size),
+        "audio chunk not sample-aligned"
+    );
+    let num_samples = pcm.len() / sample_size;
+    writeln!(output, "705-bits={}", u32::from(format.width) * 8)?;
+    writeln!(output, "705-num_channels={}", format.channels)?;
+    writeln!(output, "705-sample_rate={}", format.rate)?;
+    writeln!(output, "705-num_samples={num_samples}")?;
+    writeln!(output, "705-big_endian=0")?;
+    output.write_all(b"705-AUDIO\0")?;
+    output.write_all(&hdlc_escape(pcm))?;
+    output.write_all(b"\n705 AUDIO\n")?;
+    output.flush()
+}
+
+/// Reads a `SPEAK` message body: lines up to a lone `.` terminator.
+///
+/// Lines starting with `.` have that leading dot stripped
+/// (SMTP-style dot-stuffing, so a line of literal text can start with
+/// `.` without being mistaken for the terminator) before being joined
+/// with `\n`. Returns `Ok(None)` if the input ends before the
+/// terminator is seen.
+fn read_text_block(
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+) -> io::Result<Option<String>> {
+    let mut text = String::new();
+    let mut first = true;
+    for line in lines {
+        let line = line?;
+        if line.trim() == "." {
+            return Ok(Some(text));
+        }
+        if !first {
+            text.push('\n');
+        }
+        first = false;
+        text.push_str(line.strip_prefix('.').unwrap_or(&line));
+    }
+    Ok(None)
+}
+
 /// Connects to the Wyoming server at `uri`, confirms it responds to
 /// `describe`, and returns its voice list for `LIST VOICES` to serve
 /// later.
@@ -111,14 +191,18 @@ async fn init(uri: &str) -> Result<(Client, Vec<Voice>), ClientError> {
 
 /// A speechd module command line.
 ///
-/// More variants (`Speak`, `Stop`, `Pause`) are added as later steps
-/// implement them.
+/// More variants (`Stop`, `Pause`) are added as later steps implement
+/// them.
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     /// `INIT` — connect to the Wyoming server and confirm it responds.
     Init,
     /// `SET` — receive a multiline block of `key=value` settings.
     Set,
+    /// `AUDIO` — receive a multiline block of audio output settings.
+    Audio,
+    /// `SPEAK` — receive text and synthesize it.
+    Speak,
     /// `LIST VOICES` — report the voice list cached at `INIT` time.
     ListVoices,
     /// `QUIT` — disconnect and terminate the module.
@@ -133,6 +217,8 @@ impl Command {
         match line.trim() {
             "INIT" => Self::Init,
             "SET" => Self::Set,
+            "AUDIO" => Self::Audio,
+            "SPEAK" => Self::Speak,
             "LIST VOICES" => Self::ListVoices,
             "QUIT" => Self::Quit,
             _ => Self::Unknown,
@@ -204,6 +290,24 @@ impl Settings {
         }
         true
     }
+
+    /// Builds the Wyoming `synthesize` request for `text` under these
+    /// settings.
+    ///
+    /// `synthesis_voice` and `language` map onto the request's voice
+    /// specification; `rate`/`pitch`/`volume` have no equivalent in
+    /// Wyoming's `synthesize` event and are not sent.
+    fn to_synthesize_data(&self, text: &str) -> SynthesizeData {
+        if self.synthesis_voice.is_none() && self.language.is_none() {
+            return SynthesizeData::new(text);
+        }
+        let mut voice = match &self.synthesis_voice {
+            Some(name) => SynthesizeVoice::with_name(name.clone()),
+            None => SynthesizeVoice::new(),
+        };
+        voice.language.clone_from(&self.language);
+        SynthesizeData::new(text).with_voice(voice)
+    }
 }
 
 /// Returns the lazily-built tokio runtime used to drive Wyoming client
@@ -219,6 +323,111 @@ fn runtime_handle(
         );
     }
     Ok(runtime.as_ref().expect("just initialized above"))
+}
+
+/// Handles the `AUDIO` command: reads a `key=value` block and accepts
+/// only `audio_output_method=server`, the only output method this
+/// module supports — it streams PCM back over `705 AUDIO` rather than
+/// playing audio itself.
+fn handle_audio(
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    write_reply(output, "207 OK RECEIVING AUDIO SETTINGS\n")?;
+    let mut bad_syntax = false;
+    let mut bad_value = false;
+    for line in lines {
+        let line = line?;
+        let line = line.trim();
+        if line == "." {
+            break;
+        }
+        match line.split_once('=') {
+            Some(("audio_output_method", "server")) => {},
+            Some(("audio_output_method", _)) => bad_value = true,
+            Some(_) => {},
+            None => bad_syntax = true,
+        }
+    }
+    // A malformed line is a more fundamental protocol violation than a bad
+    // value, so it takes priority when both occur in the same block.
+    if bad_syntax {
+        write_reply(output, "302 ERROR BAD SYNTAX\n")
+    } else if bad_value {
+        write_reply(output, "303 ERROR INVALID PARAMETER OR VALUE\n")
+    } else {
+        write_reply(output, "203 OK AUDIO INITIALIZED\n")
+    }
+}
+
+/// Synthesizes `text` via `client` and streams it back to `output` as
+/// `705 AUDIO` events, bracketed by `701 BEGIN`/`702 END`.
+///
+/// `Client::start_synthesis` (which sends the request and reads
+/// `audio-start`) is private, so `200 OK SPEAKING`/`701 BEGIN` can't be
+/// emitted between it and the first audio chunk directly; instead the
+/// chunk callback emits that preamble the first time it runs, and its
+/// absence afterward distinguishes "synthesis never started" (still
+/// reply `301 ERROR CANT SPEAK`) from "synthesis started but failed
+/// partway through" (audio was already delivered, so just close with
+/// `702 END`, per the mid-stream error convention documented on
+/// `Client::synthesize_streaming`).
+fn speak(
+    rt: &tokio::runtime::Runtime,
+    client: &mut Client,
+    settings: &Settings,
+    text: &str,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    let synth_data = settings.to_synthesize_data(text);
+    let mut preamble_sent = false;
+    let mut bad_format = false;
+    let mut io_error = None;
+
+    // If the callback breaks early (I/O error or bad format), the server
+    // keeps sending audio-chunk/audio-stop events that `synthesize_streaming`
+    // drains with no timeout so the connection stays reusable; that drain
+    // isn't guarded here. Left for the STOP/PAUSE follow-up to address.
+    let result = rt.block_on(client.synthesize_streaming(synth_data, |pcm, format| {
+        let sample_size = usize::from(format.channels) * usize::from(format.width);
+        if sample_size == 0 {
+            bad_format = true;
+            return ControlFlow::Break(());
+        }
+        if !preamble_sent {
+            if let Err(e) = write_reply(output, "200 OK SPEAKING\n701 BEGIN\n") {
+                io_error = Some(e);
+                return ControlFlow::Break(());
+            }
+            preamble_sent = true;
+        }
+        let max_bytes = (MAX_CHUNK / sample_size) * sample_size;
+        for piece in pcm.chunks(max_bytes.max(sample_size)) {
+            if let Err(e) = write_audio_event(output, *format, piece) {
+                io_error = Some(e);
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    }));
+
+    if let Some(e) = io_error {
+        return Err(e);
+    }
+    match result {
+        Ok(_) if bad_format => write_reply(output, "301 ERROR CANT SPEAK\n"),
+        Ok(_) => {
+            if !preamble_sent {
+                write_reply(output, "200 OK SPEAKING\n701 BEGIN\n")?;
+            }
+            write_reply(output, "702 END\n")
+        },
+        Err(e) if preamble_sent => {
+            eprintln!("crane-wyoming: synthesis error after audio started: {e}");
+            write_reply(output, "702 END\n")
+        },
+        Err(_) => write_reply(output, "301 ERROR CANT SPEAK\n"),
+    }
 }
 
 /// Runs the speechd module command loop, reading commands from `input`
@@ -293,6 +502,23 @@ pub fn run(uri: &str, input: impl BufRead, mut output: impl Write) -> anyhow::Re
                     write_reply(&mut output, "203 OK SETTINGS RECEIVED\n")?;
                 }
             },
+            Command::Audio => handle_audio(&mut lines, &mut output)?,
+            Command::Speak => {
+                write_reply(&mut output, "202 OK RECEIVING MESSAGE\n")?;
+                let Some(text) = read_text_block(&mut lines)? else {
+                    break;
+                };
+                if text.is_empty() {
+                    write_reply(&mut output, "301 ERROR CANT SPEAK\n")?;
+                    continue;
+                }
+                let Some(connected) = client.as_mut() else {
+                    write_reply(&mut output, "301 ERROR CANT SPEAK\n")?;
+                    continue;
+                };
+                let rt = runtime_handle(&mut runtime)?;
+                speak(rt, connected, &settings, &text, &mut output)?;
+            },
             Command::ListVoices => {
                 if voices.is_empty() {
                     write_reply(&mut output, "304 CANT LIST VOICES\n")?;
@@ -351,7 +577,9 @@ mod tests {
 
     use serde_json::json;
     use wyoming_protocol::Event;
-    use wyoming_protocol::event::InfoData;
+    use wyoming_protocol::event::{
+        AudioChunkData, AudioStartData, AudioStopData, ErrorData, InfoData,
+    };
     use wyoming_protocol::wire::{read_event, write_event};
 
     use super::*;
@@ -377,6 +605,91 @@ mod tests {
                 write_event(&mut write_half, &Event::Info(info))
                     .await
                     .unwrap();
+            });
+        });
+        format!("tcp://{addr}")
+    }
+
+    /// Spawns a mock Wyoming server that answers one `describe` request
+    /// with `info`, then one `synthesize` request by streaming `chunks`
+    /// as `audio-chunk` events under `format` and closing with
+    /// `audio-stop`.
+    fn spawn_tts_server(info: InfoData, format: AudioFormat, chunks: Vec<Vec<u8>>) -> String {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let stream = tokio::net::TcpStream::from_std(stream).unwrap();
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+
+                read_event(&mut reader).await.unwrap();
+                write_event(&mut write_half, &Event::Info(info))
+                    .await
+                    .unwrap();
+
+                read_event(&mut reader).await.unwrap();
+                write_event(
+                    &mut write_half,
+                    &Event::AudioStart(AudioStartData::new(format)),
+                )
+                .await
+                .unwrap();
+                for chunk in chunks {
+                    write_event(
+                        &mut write_half,
+                        &Event::AudioChunk {
+                            data: AudioChunkData::new(format),
+                            audio: chunk,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                write_event(&mut write_half, &Event::AudioStop(AudioStopData::new()))
+                    .await
+                    .unwrap();
+            });
+        });
+        format!("tcp://{addr}")
+    }
+
+    /// Spawns a mock Wyoming server that answers `describe` with `info`,
+    /// then rejects the following `synthesize` request with an
+    /// `Event::Error` before ever sending `audio-start`.
+    fn spawn_tts_error_server(info: InfoData) -> String {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let stream = tokio::net::TcpStream::from_std(stream).unwrap();
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+
+                read_event(&mut reader).await.unwrap();
+                write_event(&mut write_half, &Event::Info(info))
+                    .await
+                    .unwrap();
+
+                read_event(&mut reader).await.unwrap();
+                write_event(
+                    &mut write_half,
+                    &Event::Error(ErrorData::new("synthesis failed")),
+                )
+                .await
+                .unwrap();
             });
         });
         format!("tcp://{addr}")
@@ -633,5 +946,302 @@ mod tests {
         .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("304 CANT LIST VOICES"));
+    }
+
+    #[test]
+    fn hdlc_escape_passes_through_ordinary_bytes() {
+        assert_eq!(hdlc_escape(b"hello"), b"hello".to_vec());
+    }
+
+    #[test]
+    fn hdlc_escape_escapes_newline() {
+        assert_eq!(
+            hdlc_escape(&[0x01, 0x0a, 0x02]),
+            vec![0x01, 0x7d, 0x2a, 0x02]
+        );
+    }
+
+    #[test]
+    fn hdlc_escape_escapes_escape_byte() {
+        assert_eq!(hdlc_escape(&[0x7d]), vec![0x7d, 0x5d]);
+    }
+
+    #[test]
+    fn hdlc_escape_empty_input() {
+        assert_eq!(hdlc_escape(&[]), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn write_audio_event_frames_one_chunk() {
+        let format = AudioFormat {
+            rate: 24000,
+            width: 2,
+            channels: 1,
+        };
+        let mut output = Vec::new();
+        write_audio_event(&mut output, format, &[0x01, 0x02, 0x03, 0x04]).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with(
+            "705-bits=16\n705-num_channels=1\n705-sample_rate=24000\n705-num_samples=2\n705-big_endian=0\n705-AUDIO\0"
+        ));
+        assert!(output.ends_with("\n705 AUDIO\n"));
+    }
+
+    #[test]
+    fn read_text_block_reads_until_dot() {
+        let mut lines = vec![
+            Ok("hello".to_string()),
+            Ok("world".to_string()),
+            Ok(".".to_string()),
+        ]
+        .into_iter();
+        assert_eq!(
+            read_text_block(&mut lines).unwrap(),
+            Some("hello\nworld".to_string())
+        );
+    }
+
+    #[test]
+    fn read_text_block_unstuffs_leading_dot() {
+        let mut lines = vec![Ok("..still text".to_string()), Ok(".".to_string())].into_iter();
+        assert_eq!(
+            read_text_block(&mut lines).unwrap(),
+            Some(".still text".to_string())
+        );
+    }
+
+    #[test]
+    fn read_text_block_empty_body() {
+        let mut lines = vec![Ok(".".to_string())].into_iter();
+        assert_eq!(read_text_block(&mut lines).unwrap(), Some(String::new()));
+    }
+
+    #[test]
+    fn read_text_block_eof_before_terminator_returns_none() {
+        let mut lines = vec![Ok("hello".to_string())].into_iter();
+        assert_eq!(read_text_block(&mut lines).unwrap(), None);
+    }
+
+    #[test]
+    fn read_text_block_preserves_leading_blank_lines() {
+        let mut lines = vec![
+            Ok(String::new()),
+            Ok("foo".to_string()),
+            Ok(".".to_string()),
+        ]
+        .into_iter();
+        assert_eq!(
+            read_text_block(&mut lines).unwrap(),
+            Some("\nfoo".to_string())
+        );
+    }
+
+    #[test]
+    fn settings_to_synthesize_data_default_has_no_voice() {
+        let settings = Settings::default();
+        assert_eq!(settings.to_synthesize_data("hi"), SynthesizeData::new("hi"));
+    }
+
+    #[test]
+    fn settings_to_synthesize_data_with_voice_name() {
+        let settings = Settings {
+            synthesis_voice: Some("de_female".to_string()),
+            ..Settings::default()
+        };
+        assert_eq!(
+            settings.to_synthesize_data("hi"),
+            SynthesizeData::new("hi").with_voice(SynthesizeVoice::with_name("de_female"))
+        );
+    }
+
+    #[test]
+    fn settings_to_synthesize_data_with_language() {
+        let settings = Settings {
+            language: Some("de".to_string()),
+            ..Settings::default()
+        };
+        let mut expected_voice = SynthesizeVoice::new();
+        expected_voice.language = Some("de".to_string());
+        assert_eq!(
+            settings.to_synthesize_data("hi"),
+            SynthesizeData::new("hi").with_voice(expected_voice)
+        );
+    }
+
+    #[test]
+    fn run_audio_server_method_replies_ok() {
+        let uri = spawn_describe_server(InfoData::new());
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nAUDIO\naudio_output_method=server\n.\nQUIT\n"[..]),
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("207 OK RECEIVING AUDIO SETTINGS"));
+        assert!(output.contains("203 OK AUDIO INITIALIZED"));
+    }
+
+    #[test]
+    fn run_audio_other_method_replies_error() {
+        let uri = spawn_describe_server(InfoData::new());
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nAUDIO\naudio_output_method=local\n.\nQUIT\n"[..]),
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("303 ERROR INVALID PARAMETER OR VALUE"));
+    }
+
+    #[test]
+    fn run_audio_bad_syntax_replies_302() {
+        let uri = spawn_describe_server(InfoData::new());
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nAUDIO\nnotakeyvalue\n.\nQUIT\n"[..]),
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("302 ERROR BAD SYNTAX"));
+    }
+
+    #[test]
+    fn run_audio_unknown_key_with_server_method_replies_ok() {
+        let uri = spawn_describe_server(InfoData::new());
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(
+                &b"INIT\nAUDIO\naudio_output_method=server\nunknown_key=value\n.\nQUIT\n"[..],
+            ),
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("203 OK AUDIO INITIALIZED"));
+    }
+
+    #[test]
+    fn run_speak_basic_streams_audio() {
+        let format = AudioFormat {
+            rate: 24000,
+            width: 2,
+            channels: 1,
+        };
+        let uri = spawn_tts_server(InfoData::new(), format, vec![vec![0x01, 0x02, 0x03, 0x04]]);
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nSPEAK\nhello world\n.\nQUIT\n"[..]),
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("202 OK RECEIVING MESSAGE"));
+        assert!(output.contains("200 OK SPEAKING"));
+        assert!(output.contains("701 BEGIN"));
+        assert!(output.contains("705-sample_rate=24000"));
+        assert!(output.contains("705 AUDIO"));
+        assert!(output.contains("702 END"));
+        // BEGIN must precede END.
+        assert!(output.find("701 BEGIN").unwrap() < output.find("702 END").unwrap());
+    }
+
+    #[test]
+    fn run_speak_empty_text_replies_error() {
+        let uri = spawn_describe_server(InfoData::new());
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nSPEAK\n.\nQUIT\n"[..]),
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("301 ERROR CANT SPEAK"));
+        assert!(!output.contains("701 BEGIN"));
+    }
+
+    #[test]
+    fn run_speak_without_init_replies_error() {
+        let mut output = Vec::new();
+        run(
+            "tcp://127.0.0.1:1",
+            Cursor::new(&b"SPEAK\nhello\n.\nQUIT\n"[..]),
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("301 ERROR CANT SPEAK"));
+    }
+
+    #[test]
+    fn run_speak_synthesis_error_replies_error() {
+        let uri = spawn_tts_error_server(InfoData::new());
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nSPEAK\nhello\n.\nQUIT\n"[..]),
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("301 ERROR CANT SPEAK"));
+        assert!(!output.contains("701 BEGIN"));
+    }
+
+    #[test]
+    fn run_speak_zero_width_format_replies_error() {
+        let format = AudioFormat {
+            rate: 24000,
+            width: 0,
+            channels: 1,
+        };
+        let uri = spawn_tts_server(InfoData::new(), format, vec![vec![0x00, 0x00]]);
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nSPEAK\nhello\n.\nQUIT\n"[..]),
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("301 ERROR CANT SPEAK"));
+        assert!(!output.contains("701 BEGIN"));
+    }
+
+    #[test]
+    fn run_speak_escapes_newline_and_escape_bytes_in_audio() {
+        let format = AudioFormat {
+            rate: 16000,
+            width: 1,
+            channels: 1,
+        };
+        let uri = spawn_tts_server(InfoData::new(), format, vec![vec![0x0a, 0x7d, 0x03]]);
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nSPEAK\nhi\n.\nQUIT\n"[..]),
+            &mut output,
+        )
+        .unwrap();
+        let marker = b"705-AUDIO\0";
+        let start = output
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .unwrap()
+            + marker.len();
+        let end = start
+            + output[start..]
+                .windows(2)
+                .position(|w| w == b"\n7")
+                .unwrap();
+        assert_eq!(&output[start..end], &[0x7d, 0x2a, 0x7d, 0x5d, 0x03]);
     }
 }
