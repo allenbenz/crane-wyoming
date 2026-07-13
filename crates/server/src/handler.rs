@@ -25,6 +25,16 @@ use wyoming_protocol::event::{
 };
 use wyoming_protocol::wire::{read_event, write_event};
 
+/// Extracts the base subtag of a language tag, lowercased, e.g. `"de-DE"`,
+/// `"de_DE"`, and `"DE"` all become `"de"`.
+fn base_language_subtag(language: &str) -> String {
+    language
+        .split(['-', '_'])
+        .next()
+        .unwrap_or(language)
+        .to_ascii_lowercase()
+}
+
 /// Maps voice names to TTS model registration names.
 ///
 /// Built once at startup by scanning all registered TTS models' voices.
@@ -35,12 +45,16 @@ use wyoming_protocol::wire::{read_event, write_event};
 pub struct VoiceMap {
     /// voice name -> model registration name
     map: HashMap<String, String>,
+    /// lowercased base language subtag (e.g. "de" for "de" or "de-DE") ->
+    /// (model registration name, voice name) of the first voice offering
+    /// that language.
+    by_language: HashMap<String, (String, String)>,
     /// Registration names of all configured models that were found in the
     /// runtime (used to distinguish "no voices left after dedup" from
     /// "not a configured model" in service discovery).
     model_names: HashSet<String>,
     /// Name of the default model, used when a `synthesize` event specifies
-    /// no voice.
+    /// no voice and no language matching any known voice.
     default_model: Option<String>,
 }
 
@@ -49,10 +63,12 @@ impl VoiceMap {
     ///
     /// `model_names` gives model registration names in priority order
     /// (typically command-line `--model` order); the first model to claim
-    /// a voice name wins. Names not found in `runtime` are skipped.
+    /// a voice name, or a language, wins. Names not found in `runtime` are
+    /// skipped.
     #[must_use]
     pub fn new(model_names: &[String], runtime: &ModelRuntime) -> Self {
         let mut map = HashMap::new();
+        let mut by_language = HashMap::new();
         let mut found_names = HashSet::new();
         for name in model_names {
             let Some(handle) = runtime.tts_handle(name) else {
@@ -73,11 +89,18 @@ impl VoiceMap {
                         );
                     },
                 }
+                for language in &voice.languages {
+                    let base = base_language_subtag(language);
+                    by_language
+                        .entry(base)
+                        .or_insert_with(|| (name.clone(), voice.name.clone()));
+                }
             }
         }
         let default_model = runtime.default_tts_name().map(String::from);
         Self {
             map,
+            by_language,
             model_names: found_names,
             default_model,
         }
@@ -87,6 +110,19 @@ impl VoiceMap {
     #[must_use]
     pub fn model_for_voice(&self, voice_name: &str) -> Option<&str> {
         self.map.get(voice_name).map(String::as_str)
+    }
+
+    /// Returns the `(model registration name, voice name)` of the first
+    /// registered voice offering `language`, if any.
+    ///
+    /// Matching compares only the base subtag (the part before a `-` or
+    /// `_`), case-insensitively, so a request for `"de"` matches a voice
+    /// tagged `"de"`, `"de-DE"`, or `"de_DE"`.
+    #[must_use]
+    pub fn model_for_language(&self, language: &str) -> Option<(&str, &str)> {
+        self.by_language
+            .get(&base_language_subtag(language))
+            .map(|(model, voice)| (model.as_str(), voice.as_str()))
     }
 
     /// Returns `true` if `name` is a configured model registration name.
@@ -103,31 +139,49 @@ impl VoiceMap {
 }
 
 /// Outcome of resolving a `synthesize` event's voice to a model.
-enum VoiceResolution<'m, 'd> {
+enum VoiceResolution<'m> {
     /// A model was resolved. `voice_name` is `None` when the client did not
-    /// request a specific voice (the model's default voice is used).
+    /// request a specific voice or language matching any known voice (the
+    /// model's default voice is used).
+    ///
+    /// `voice_name` is owned rather than borrowed because a language match
+    /// yields a name borrowed from `VoiceMap` (lifetime `'m`), which can't
+    /// unify with a borrow of `data`'s lifetime without a `Cow` or an extra
+    /// lifetime parameter on this enum.
     Found {
         model_name: &'m str,
-        voice_name: Option<&'d str>,
+        voice_name: Option<String>,
     },
     /// The client requested a voice name with no matching model.
-    NotFound(&'d str),
+    NotFound(String),
     /// No voice was requested and no TTS model is loaded.
     NoModel,
 }
 
 /// Resolve which model (and voice) a `synthesize` event should use.
-fn resolve_voice<'m, 'd>(
-    voice_map: &'m VoiceMap,
-    data: &'d SynthesizeData,
-) -> VoiceResolution<'m, 'd> {
+///
+/// An explicit voice name always wins. Otherwise, if the request names a
+/// language, it is matched against known voices' languages -- see
+/// [`VoiceMap::model_for_language`] -- so e.g. `language: "de"` with no
+/// voice picks a German voice instead of silently falling back to
+/// whichever voice happens to be the configured default. Only when neither
+/// resolves does the default model apply.
+fn resolve_voice<'m>(voice_map: &'m VoiceMap, data: &SynthesizeData) -> VoiceResolution<'m> {
     if let Some(voice_name) = data.voice.as_ref().and_then(|v| v.name.as_deref()) {
         return match voice_map.model_for_voice(voice_name) {
             Some(model_name) => VoiceResolution::Found {
                 model_name,
-                voice_name: Some(voice_name),
+                voice_name: Some(voice_name.to_string()),
             },
-            None => VoiceResolution::NotFound(voice_name),
+            None => VoiceResolution::NotFound(voice_name.to_string()),
+        };
+    }
+    if let Some(language) = data.voice.as_ref().and_then(|v| v.language.as_deref())
+        && let Some((model_name, voice_name)) = voice_map.model_for_language(language)
+    {
+        return VoiceResolution::Found {
+            model_name,
+            voice_name: Some(voice_name.to_string()),
         };
     }
     match voice_map.default_model() {
@@ -334,7 +388,7 @@ where
         VoiceResolution::Found {
             model_name,
             voice_name,
-        } => (model_name, voice_name.map(String::from)),
+        } => (model_name, voice_name),
         VoiceResolution::NotFound(voice_name) => {
             tracing::warn!(voice = %voice_name, "Voice not found");
             return send_error(
@@ -898,6 +952,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_synthesize_language_fallback_voice() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "a".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(
+                24000,
+                vec![VoiceInfo {
+                    name: "casual".into(),
+                    languages: vec!["en".into()],
+                }],
+            )),
+        )
+        .unwrap();
+        rt.register_tts(
+            "b".into(),
+            "voxtral_tts",
+            Box::new(MockTts::new(
+                16000,
+                vec![VoiceInfo {
+                    name: "de_female".into(),
+                    languages: vec!["de".into()],
+                }],
+            )),
+        )
+        .unwrap();
+        // "a" is the default model (registered first), but a request for
+        // German with no explicit voice must resolve to "b"'s German voice
+        // instead of silently falling back to the (English) default.
+        let vm = VoiceMap::new(&["a".to_string(), "b".to_string()], &rt);
+
+        let mut voice = SynthesizeVoice::new();
+        voice.language = Some("de-DE".to_string());
+        let results = run_events(
+            &rt,
+            &vm,
+            vec![Event::Synthesize(
+                SynthesizeData::new("hi").with_voice(voice),
+            )],
+        )
+        .await;
+
+        match &results[0] {
+            Event::AudioStart(data) => assert_eq!(data.rate, 16000),
+            other => panic!("expected AudioStart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_synthesize_named_voice_overrides_language() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "a".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(
+                24000,
+                vec![VoiceInfo {
+                    name: "casual".into(),
+                    languages: vec!["en".into()],
+                }],
+            )),
+        )
+        .unwrap();
+        rt.register_tts(
+            "b".into(),
+            "voxtral_tts",
+            Box::new(MockTts::new(
+                16000,
+                vec![VoiceInfo {
+                    name: "de_female".into(),
+                    languages: vec!["de".into()],
+                }],
+            )),
+        )
+        .unwrap();
+        let vm = VoiceMap::new(&["a".to_string(), "b".to_string()], &rt);
+
+        // Explicit voice name ("casual", model "a") conflicts with the
+        // language ("de", which matches model "b"); the name must win.
+        let mut voice = SynthesizeVoice::with_name("casual");
+        voice.language = Some("de".to_string());
+        let results = run_events(
+            &rt,
+            &vm,
+            vec![Event::Synthesize(
+                SynthesizeData::new("hi").with_voice(voice),
+            )],
+        )
+        .await;
+
+        match &results[0] {
+            Event::AudioStart(data) => assert_eq!(data.rate, 24000),
+            other => panic!("expected AudioStart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_synthesize_unmatched_language_falls_back_to_default() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "a".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(
+                24000,
+                vec![VoiceInfo {
+                    name: "casual".into(),
+                    languages: vec!["en".into()],
+                }],
+            )),
+        )
+        .unwrap();
+        rt.register_tts(
+            "b".into(),
+            "voxtral_tts",
+            Box::new(MockTts::new(
+                16000,
+                vec![VoiceInfo {
+                    name: "de_female".into(),
+                    languages: vec!["de".into()],
+                }],
+            )),
+        )
+        .unwrap();
+        let vm = VoiceMap::new(&["a".to_string(), "b".to_string()], &rt);
+
+        // "fr" matches no registered voice, so this must fall back to the
+        // default model "a", not error and not pick "b".
+        let mut voice = SynthesizeVoice::new();
+        voice.language = Some("fr".to_string());
+        let results = run_events(
+            &rt,
+            &vm,
+            vec![Event::Synthesize(
+                SynthesizeData::new("hi").with_voice(voice),
+            )],
+        )
+        .await;
+
+        match &results[0] {
+            Event::AudioStart(data) => assert_eq!(data.rate, 24000),
+            other => panic!("expected AudioStart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_synthesize_unknown_voice() {
         let mut rt = test_runtime();
         rt.register_tts(
@@ -1411,6 +1610,69 @@ mod tests {
         let vm = VoiceMap::new(&[], &rt);
         assert_eq!(vm.default_model(), None);
         assert_eq!(vm.model_for_voice("anything"), None);
+    }
+
+    #[test]
+    fn test_voice_map_language_lookup() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "m1".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(
+                24000,
+                vec![
+                    VoiceInfo {
+                        name: "de_female".into(),
+                        languages: vec!["de".into()],
+                    },
+                    VoiceInfo {
+                        name: "casual".into(),
+                        languages: vec!["en".into()],
+                    },
+                ],
+            )),
+        )
+        .unwrap();
+        let vm = VoiceMap::new(&["m1".to_string()], &rt);
+
+        assert_eq!(vm.model_for_language("de"), Some(("m1", "de_female")));
+        // Matching is on the base subtag only, case-insensitively, and
+        // accepts both `-` and `_` as the subtag separator.
+        assert_eq!(vm.model_for_language("DE-DE"), Some(("m1", "de_female")));
+        assert_eq!(vm.model_for_language("de_DE"), Some(("m1", "de_female")));
+        assert_eq!(vm.model_for_language("fr"), None);
+    }
+
+    #[test]
+    fn test_voice_map_language_first_model_wins() {
+        let mut rt = test_runtime();
+        rt.register_tts(
+            "first".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new(
+                24000,
+                vec![VoiceInfo {
+                    name: "alice".into(),
+                    languages: vec!["de".into()],
+                }],
+            )),
+        )
+        .unwrap();
+        rt.register_tts(
+            "second".into(),
+            "voxtral_tts",
+            Box::new(MockTts::new(
+                16000,
+                vec![VoiceInfo {
+                    name: "bob".into(),
+                    languages: vec!["de".into()],
+                }],
+            )),
+        )
+        .unwrap();
+
+        let vm = VoiceMap::new(&["first".to_string(), "second".to_string()], &rt);
+        assert_eq!(vm.model_for_language("de"), Some(("first", "alice")));
     }
 
     #[tokio::test]
