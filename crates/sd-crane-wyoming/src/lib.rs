@@ -14,10 +14,58 @@
 use std::io::{self, BufRead, Write};
 use std::ops::ControlFlow;
 use std::os::fd::BorrowedFd;
+use std::sync::OnceLock;
 
 use anyhow::Context;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{Registry, reload};
 use wyoming_protocol::event::{InfoData, SynthesizeData, SynthesizeVoice};
 use wyoming_protocol::{AudioFormat, Client, ClientError};
+
+/// Reload handle for the `tracing` level filter, set once by
+/// [`init_logging`] and used by [`set_log_level`] to change verbosity in
+/// response to speechd's `LOGLEVEL` command.
+static LOG_RELOAD: OnceLock<reload::Handle<LevelFilter, Registry>> = OnceLock::new();
+
+/// Initializes the `tracing` subscriber, writing to stderr — the stream
+/// speechd captures into its own log for this module.
+///
+/// Starts at [`LevelFilter::INFO`] (speechd's own default log level, `3`);
+/// [`set_log_level`] adjusts it later in response to speechd's `LOGLEVEL`
+/// command.
+fn init_logging() {
+    let (filter, handle) = reload::Layer::new(LevelFilter::INFO);
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(io::stderr)
+                .with_target(false)
+                .compact(),
+        )
+        .init();
+    LOG_RELOAD.set(handle).ok();
+}
+
+/// Maps speechd's `LOGLEVEL` value onto a `tracing` [`LevelFilter`] and
+/// applies it via the reload handle set up by [`init_logging`].
+///
+/// The mapping follows speechd's own convention (see `module_utils.c`'s
+/// `MSG`/`DBG` macros): `1` is fatal-only, `3` is speechd's default
+/// (warnings), `4` is debug, and `5`+ is verbose/trace.
+fn set_log_level(speechd_level: i32) {
+    let filter = match speechd_level {
+        ..=1 => LevelFilter::ERROR,
+        2 => LevelFilter::WARN,
+        3 => LevelFilter::INFO,
+        4 => LevelFilter::DEBUG,
+        _ => LevelFilter::TRACE,
+    };
+    if let Some(handle) = LOG_RELOAD.get() {
+        let _ = handle.modify(|f| *f = filter);
+    }
+}
 
 /// A voice offered by the connected Wyoming server, as reported by
 /// `describe` and cached at `INIT` time for `LIST VOICES`.
@@ -476,9 +524,9 @@ fn handle_audio(
 /// speechd's `module.c` kills and unregisters the whole module if this
 /// command doesn't return a `2xx` reply, right after `AUDIO` and before
 /// ever requesting `LIST VOICES` — so this module must at least accept
-/// the command, even though it has no log-level-dependent behavior to
-/// configure. `log_level` is validated as an integer (matching speechd's
-/// own reference module) but otherwise ignored.
+/// the command. `log_level` is validated as an integer (matching
+/// speechd's own reference module) and, on success, applied via
+/// [`set_log_level`].
 ///
 /// Unlike `handle_audio`, unrecognized keys are rejected here, matching
 /// `SET`'s strictness, since there is no other accepted key to be lenient
@@ -488,12 +536,29 @@ fn handle_loglevel(
     output: &mut impl Write,
 ) -> io::Result<()> {
     write_reply(output, "207 OK RECEIVING LOGLEVEL SETTINGS\n")?;
-    match read_kv_block(lines, |key, value| {
-        key == "log_level" && value.parse::<i32>().is_ok()
-    })? {
+    let mut level = None;
+    let result = read_kv_block(lines, |key, value| {
+        if key != "log_level" {
+            return false;
+        }
+        match value.parse::<i32>() {
+            Ok(n) => {
+                level = Some(n);
+                true
+            },
+            Err(_) => false,
+        }
+    })?;
+    match result {
         Some(BlockError::BadSyntax) => write_reply(output, "302 ERROR BAD SYNTAX\n"),
         Some(BlockError::BadValue) => write_reply(output, "303 ERROR INVALID PARAMETER OR VALUE\n"),
-        None => write_reply(output, "203 OK LOGLEVEL SET\n"),
+        None => {
+            if let Some(n) = level {
+                set_log_level(n);
+                tracing::debug!("log level set to {n}");
+            }
+            write_reply(output, "203 OK LOGLEVEL SET\n")
+        },
     }
 }
 
@@ -583,6 +648,7 @@ fn speak(
         return Err(e);
     }
     if let Some(intr) = interrupt {
+        tracing::debug!("interrupted: {intr:?}");
         return write_reply(output, intr.reply());
     }
     match result {
@@ -594,7 +660,7 @@ fn speak(
             write_reply(output, "702 END\n")
         },
         Err(e) if preamble_sent => {
-            eprintln!("crane-wyoming: synthesis error after audio started: {e}");
+            tracing::warn!("synthesis error after audio started: {e}");
             write_reply(output, "702 END\n")
         },
         Err(_) => write_reply(output, "301 ERROR CANT SPEAK\n"),
@@ -630,11 +696,17 @@ pub fn run(
 
     while let Some(line) = lines.next() {
         let line = line?;
-        match Command::parse(&line) {
+        let command = Command::parse(&line);
+        tracing::debug!("command: {command:?}");
+        match command {
             Command::Init => {
                 let rt = runtime_handle(&mut runtime)?;
                 match rt.block_on(init(uri)) {
                     Ok((connected, discovered_voices)) => {
+                        tracing::info!(
+                            "connected to {uri}, discovered {} voice(s)",
+                            discovered_voices.len()
+                        );
                         client = Some(connected);
                         voices = discovered_voices;
                         write_reply(
@@ -644,6 +716,7 @@ pub fn run(
                     },
                     Err(e) => {
                         let message = e.to_string().replace('\n', " ");
+                        tracing::warn!("init failed: {message}");
                         write_reply(
                             &mut output,
                             &format!("399-{message}\n399 ERR CANT INIT MODULE\n"),
@@ -667,6 +740,7 @@ pub fn run(
                     write_reply(&mut output, "301 ERROR CANT SPEAK\n")?;
                     continue;
                 };
+                tracing::debug!("synthesizing {} byte(s) of text", text.len());
                 let rt = runtime_handle(&mut runtime)?;
                 let mut poll_interrupt = || interrupt_fd.and_then(poll_fd_interrupt);
                 speak(
@@ -715,6 +789,7 @@ pub fn run(
 /// Returns an error if the config path is missing or unreadable, or if
 /// it has no `CraneURI` directive.
 pub fn cli_main() -> anyhow::Result<()> {
+    init_logging();
     let config_path = std::env::args()
         .nth(1)
         .context("usage: sd_crane_wyoming <config-path>")?;
