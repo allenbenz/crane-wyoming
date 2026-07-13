@@ -5,6 +5,10 @@ advanced users: it depends on unreleased, git-pinned Crane dependencies and
 requires building from source. You have to expect rough edges and no
 compatibility guarantees yet.
 
+<p align="center">
+  <img src="dist/assets/crane-wyoming.png" alt="crane-wyoming logo" width="200">
+</p>
+
 [Wyoming](https://github.com/rhasspy/wyoming) is the protocol Home Assistant
 uses to talk to local voice services (wake word, speech-to-text,
 text-to-speech, intent recognition) over the network: a JSON event header per
