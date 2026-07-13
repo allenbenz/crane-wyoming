@@ -7,12 +7,13 @@
 //! the resulting voice list; `SET` stores per-utterance settings for a
 //! later `SPEAK`; `AUDIO` accepts server-side audio output; `SPEAK`
 //! synthesizes text and streams it back as `705 AUDIO` events;
-//! `LIST VOICES` answers from the cached list; `QUIT` disconnects;
-//! anything else is rejected as unknown. A later step adds
-//! `STOP`/`PAUSE`.
+//! `LIST VOICES` answers from the cached list; `STOP`/`PAUSE` abort
+//! in-flight synthesis; `QUIT` disconnects; anything else is rejected
+//! as unknown.
 
 use std::io::{self, BufRead, Write};
 use std::ops::ControlFlow;
+use std::os::fd::BorrowedFd;
 
 use anyhow::Context;
 use wyoming_protocol::event::{InfoData, SynthesizeData, SynthesizeVoice};
@@ -190,9 +191,6 @@ async fn init(uri: &str) -> Result<(Client, Vec<Voice>), ClientError> {
 }
 
 /// A speechd module command line.
-///
-/// More variants (`Stop`, `Pause`) are added as later steps implement
-/// them.
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     /// `INIT` — connect to the Wyoming server and confirm it responds.
@@ -205,6 +203,10 @@ enum Command {
     Speak,
     /// `LIST VOICES` — report the voice list cached at `INIT` time.
     ListVoices,
+    /// `STOP` — abort in-flight synthesis.
+    Stop,
+    /// `PAUSE` — abort in-flight synthesis (same handling as `STOP`).
+    Pause,
     /// `QUIT` — disconnect and terminate the module.
     Quit,
     /// Any other command, not yet supported.
@@ -220,9 +222,82 @@ impl Command {
             "AUDIO" => Self::Audio,
             "SPEAK" => Self::Speak,
             "LIST VOICES" => Self::ListVoices,
+            "STOP" => Self::Stop,
+            "PAUSE" => Self::Pause,
             "QUIT" => Self::Quit,
             _ => Self::Unknown,
         }
+    }
+}
+
+/// A mid-synthesis interrupt requested by speechd, detected by polling
+/// stdin between audio chunks in [`speak`].
+///
+/// Neural TTS here has no mid-utterance resume, so `STOP` and `PAUSE`
+/// abort synthesis identically — only the speechd reply code differs
+/// (`703 STOP` vs. `704 PAUSE`), since speechd's server treats them
+/// differently for queue bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Interrupt {
+    /// speechd sent `STOP`.
+    Stop,
+    /// speechd sent `PAUSE`.
+    Pause,
+}
+
+impl Interrupt {
+    /// The speechd reply line for this interrupt.
+    const fn reply(self) -> &'static str {
+        match self {
+            Self::Stop => "703 STOP\n",
+            Self::Pause => "704 PAUSE\n",
+        }
+    }
+}
+
+/// Checks `fd` for a pending, complete `STOP`/`PAUSE` line without
+/// blocking, consuming it if present.
+///
+/// Used to poll stdin for an interrupt between audio chunks during
+/// `SPEAK`, while the main command loop is blocked driving synthesis.
+/// The main loop's `BufRead` line iterator is dormant for the whole
+/// `SPEAK` — nothing calls `lines.next()` again until `speak` returns —
+/// so its internal buffer can't already hold bytes this function needs;
+/// bypassing it and reading `fd` directly here is therefore safe, not
+/// just convenient. speechd always writes `STOP`/`PAUSE` as a single,
+/// separate pipe write (well under `PIPE_BUF`), so a byte-at-a-time read
+/// here can't observe a partial line from a still-in-flight write. Any
+/// other text pending on `fd` (there shouldn't be any — speechd doesn't
+/// pipeline commands) is silently consumed and ignored. The read is
+/// bounded by the byte count `ioctl_fionread` reports up front, so a
+/// buggy peer that sends data without a trailing newline can't block
+/// this function waiting for one.
+fn poll_fd_interrupt(fd: BorrowedFd<'_>) -> Option<Interrupt> {
+    let avail = rustix::io::ioctl_fionread(fd).unwrap_or(0);
+    if avail == 0 {
+        return None;
+    }
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    let mut remaining = avail;
+    loop {
+        if remaining == 0 {
+            return None;
+        }
+        match rustix::io::read(fd, &mut byte[..]) {
+            Ok(1) if byte[0] == b'\n' => break,
+            Ok(1) => {
+                line.push(byte[0]);
+                remaining -= 1;
+            },
+            Err(rustix::io::Errno::INTR) => {},
+            _ => return None,
+        }
+    }
+    match String::from_utf8_lossy(&line).trim() {
+        "STOP" => Some(Interrupt::Stop),
+        "PAUSE" => Some(Interrupt::Pause),
+        _ => None,
     }
 }
 
@@ -325,15 +400,28 @@ fn runtime_handle(
     Ok(runtime.as_ref().expect("just initialized above"))
 }
 
-/// Handles the `AUDIO` command: reads a `key=value` block and accepts
-/// only `audio_output_method=server`, the only output method this
-/// module supports — it streams PCM back over `705 AUDIO` rather than
-/// playing audio itself.
-fn handle_audio(
+/// Why a `key=value` block read by [`read_kv_block`] was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockError {
+    /// A line wasn't of the form `key=value`.
+    BadSyntax,
+    /// `apply` rejected a line's key or value.
+    BadValue,
+}
+
+/// Reads a dot-terminated `key=value` block from `lines`, calling `apply`
+/// with each line's key and value.
+///
+/// `apply` returns `false` to reject a line's value. A line that isn't
+/// `key=value` at all is a [`BlockError::BadSyntax`], which takes
+/// priority over a [`BlockError::BadValue`] if both occur in the same
+/// block, since a malformed line is a more fundamental protocol
+/// violation than a bad value. Every line in the block is processed
+/// regardless of earlier errors.
+fn read_kv_block(
     lines: &mut impl Iterator<Item = io::Result<String>>,
-    output: &mut impl Write,
-) -> io::Result<()> {
-    write_reply(output, "207 OK RECEIVING AUDIO SETTINGS\n")?;
+    mut apply: impl FnMut(&str, &str) -> bool,
+) -> io::Result<Option<BlockError>> {
     let mut bad_syntax = false;
     let mut bad_value = false;
     for line in lines {
@@ -343,20 +431,60 @@ fn handle_audio(
             break;
         }
         match line.split_once('=') {
-            Some(("audio_output_method", "server")) => {},
-            Some(("audio_output_method", _)) => bad_value = true,
-            Some(_) => {},
+            Some((key, value)) => {
+                if !apply(key, value) {
+                    bad_value = true;
+                }
+            },
             None => bad_syntax = true,
         }
     }
-    // A malformed line is a more fundamental protocol violation than a bad
-    // value, so it takes priority when both occur in the same block.
-    if bad_syntax {
-        write_reply(output, "302 ERROR BAD SYNTAX\n")
+    Ok(if bad_syntax {
+        Some(BlockError::BadSyntax)
     } else if bad_value {
-        write_reply(output, "303 ERROR INVALID PARAMETER OR VALUE\n")
+        Some(BlockError::BadValue)
     } else {
-        write_reply(output, "203 OK AUDIO INITIALIZED\n")
+        None
+    })
+}
+
+/// Handles the `AUDIO` command: reads a `key=value` block and accepts
+/// only `audio_output_method=server`, the only output method this
+/// module supports — it streams PCM back over `705 AUDIO` rather than
+/// playing audio itself.
+fn handle_audio(
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    write_reply(output, "207 OK RECEIVING AUDIO SETTINGS\n")?;
+    match read_kv_block(lines, |key, value| {
+        key != "audio_output_method" || value == "server"
+    })? {
+        Some(BlockError::BadSyntax) => write_reply(output, "302 ERROR BAD SYNTAX\n"),
+        Some(BlockError::BadValue) => write_reply(output, "303 ERROR INVALID PARAMETER OR VALUE\n"),
+        None => write_reply(output, "203 OK AUDIO INITIALIZED\n"),
+    }
+}
+
+/// Handles the `SET` command: reads a `key=value` block and applies it
+/// to `settings` for the next `SPEAK`.
+///
+/// A block with any invalid line leaves `settings` untouched — either
+/// every line in the block commits, or none of them do.
+fn handle_set(
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+    output: &mut impl Write,
+    settings: &mut Settings,
+) -> io::Result<()> {
+    write_reply(output, "203 OK RECEIVING SETTINGS\n")?;
+    let mut scratch = settings.clone();
+    match read_kv_block(lines, |key, value| scratch.apply(key, value))? {
+        Some(BlockError::BadSyntax) => write_reply(output, "302 ERROR BAD SYNTAX\n"),
+        Some(BlockError::BadValue) => write_reply(output, "303 ERROR INVALID PARAMETER OR VALUE\n"),
+        None => {
+            *settings = scratch;
+            write_reply(output, "203 OK SETTINGS RECEIVED\n")
+        },
     }
 }
 
@@ -372,22 +500,27 @@ fn handle_audio(
 /// partway through" (audio was already delivered, so just close with
 /// `702 END`, per the mid-stream error convention documented on
 /// `Client::synthesize_streaming`).
+///
+/// `poll_interrupt` is polled once per audio piece; when it reports a
+/// `STOP`/`PAUSE`, synthesis is aborted (the chunk callback returns
+/// `ControlFlow::Break`, so `synthesize_streaming` drains and discards
+/// the remaining `audio-chunk`/`audio-stop` events itself, leaving the
+/// connection ready for the next `SPEAK`) and `703 STOP`/`704 PAUSE`
+/// is sent instead of `702 END`.
 fn speak(
     rt: &tokio::runtime::Runtime,
     client: &mut Client,
     settings: &Settings,
     text: &str,
     output: &mut impl Write,
+    poll_interrupt: &mut impl FnMut() -> Option<Interrupt>,
 ) -> io::Result<()> {
     let synth_data = settings.to_synthesize_data(text);
     let mut preamble_sent = false;
     let mut bad_format = false;
     let mut io_error = None;
+    let mut interrupt = None;
 
-    // If the callback breaks early (I/O error or bad format), the server
-    // keeps sending audio-chunk/audio-stop events that `synthesize_streaming`
-    // drains with no timeout so the connection stays reusable; that drain
-    // isn't guarded here. Left for the STOP/PAUSE follow-up to address.
     let result = rt.block_on(client.synthesize_streaming(synth_data, |pcm, format| {
         let sample_size = usize::from(format.channels) * usize::from(format.width);
         if sample_size == 0 {
@@ -403,6 +536,10 @@ fn speak(
         }
         let max_bytes = (MAX_CHUNK / sample_size) * sample_size;
         for piece in pcm.chunks(max_bytes.max(sample_size)) {
+            if let Some(intr) = poll_interrupt() {
+                interrupt = Some(intr);
+                return ControlFlow::Break(());
+            }
             if let Err(e) = write_audio_event(output, *format, piece) {
                 io_error = Some(e);
                 return ControlFlow::Break(());
@@ -413,6 +550,9 @@ fn speak(
 
     if let Some(e) = io_error {
         return Err(e);
+    }
+    if let Some(intr) = interrupt {
+        return write_reply(output, intr.reply());
     }
     match result {
         Ok(_) if bad_format => write_reply(output, "301 ERROR CANT SPEAK\n"),
@@ -436,11 +576,21 @@ fn speak(
 /// Builds its own single-threaded tokio runtime to drive Wyoming client
 /// calls from this otherwise-synchronous, blocking command loop.
 ///
+/// `interrupt_fd`, if given, is polled for a pending `STOP`/`PAUSE` line
+/// between audio chunks during `SPEAK` (see [`poll_fd_interrupt`]);
+/// `None` disables interrupt polling (used by tests driving `run` with
+/// an in-memory `input` that has no underlying file descriptor to poll).
+///
 /// # Errors
 ///
 /// Returns an error if `input`/`output` fail, or if the tokio runtime
 /// can't be built.
-pub fn run(uri: &str, input: impl BufRead, mut output: impl Write) -> anyhow::Result<()> {
+pub fn run(
+    uri: &str,
+    input: impl BufRead,
+    mut output: impl Write,
+    interrupt_fd: Option<BorrowedFd<'_>>,
+) -> anyhow::Result<()> {
     let mut runtime: Option<tokio::runtime::Runtime> = None;
     let mut client: Option<Client> = None;
     let mut voices: Vec<Voice> = Vec::new();
@@ -470,38 +620,7 @@ pub fn run(uri: &str, input: impl BufRead, mut output: impl Write) -> anyhow::Re
                     },
                 }
             },
-            Command::Set => {
-                write_reply(&mut output, "203 OK RECEIVING SETTINGS\n")?;
-                let mut scratch = settings.clone();
-                let mut bad_syntax = false;
-                let mut bad_value = false;
-                for line in lines.by_ref() {
-                    let line = line?;
-                    let line = line.trim();
-                    if line == "." {
-                        break;
-                    }
-                    match line.split_once('=') {
-                        Some((key, value)) => {
-                            if !scratch.apply(key, value) {
-                                bad_value = true;
-                            }
-                        },
-                        None => bad_syntax = true,
-                    }
-                }
-                // A malformed line is a more fundamental protocol violation
-                // than a bad value, so it takes priority when both occur in
-                // the same block.
-                if bad_syntax {
-                    write_reply(&mut output, "302 ERROR BAD SYNTAX\n")?;
-                } else if bad_value {
-                    write_reply(&mut output, "303 ERROR INVALID PARAMETER OR VALUE\n")?;
-                } else {
-                    settings = scratch;
-                    write_reply(&mut output, "203 OK SETTINGS RECEIVED\n")?;
-                }
-            },
+            Command::Set => handle_set(&mut lines, &mut output, &mut settings)?,
             Command::Audio => handle_audio(&mut lines, &mut output)?,
             Command::Speak => {
                 write_reply(&mut output, "202 OK RECEIVING MESSAGE\n")?;
@@ -517,7 +636,15 @@ pub fn run(uri: &str, input: impl BufRead, mut output: impl Write) -> anyhow::Re
                     continue;
                 };
                 let rt = runtime_handle(&mut runtime)?;
-                speak(rt, connected, &settings, &text, &mut output)?;
+                let mut poll_interrupt = || interrupt_fd.and_then(poll_fd_interrupt);
+                speak(
+                    rt,
+                    connected,
+                    &settings,
+                    &text,
+                    &mut output,
+                    &mut poll_interrupt,
+                )?;
             },
             Command::ListVoices => {
                 if voices.is_empty() {
@@ -535,6 +662,8 @@ pub fn run(uri: &str, input: impl BufRead, mut output: impl Write) -> anyhow::Re
                     write_reply(&mut output, "200 OK VOICE LIST SENT\n")?;
                 }
             },
+            Command::Stop => write_reply(&mut output, Interrupt::Stop.reply())?,
+            Command::Pause => write_reply(&mut output, Interrupt::Pause.reply())?,
             Command::Quit => {
                 client.take();
                 write_reply(&mut output, "210 OK QUIT\n")?;
@@ -567,13 +696,18 @@ pub fn cli_main() -> anyhow::Result<()> {
     };
 
     let stdin = io::stdin();
-    run(&uri, stdin.lock(), io::stdout())
+    // SAFETY: fd 0 (stdin) is open and owned by this process for its
+    // entire lifetime.
+    let interrupt_fd = unsafe { BorrowedFd::borrow_raw(0) };
+    run(&uri, stdin.lock(), io::stdout(), Some(interrupt_fd))
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
     use std::net::TcpListener as StdTcpListener;
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixStream;
 
     use serde_json::json;
     use wyoming_protocol::Event;
@@ -719,7 +853,7 @@ mod tests {
     fn run_init_success_replies_ok_then_quit() {
         let uri = spawn_describe_server(InfoData::new());
         let mut output = Vec::new();
-        run(&uri, Cursor::new(&b"INIT\nQUIT\n"[..]), &mut output).unwrap();
+        run(&uri, Cursor::new(&b"INIT\nQUIT\n"[..]), &mut output, None).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("299 OK LOADED SUCCESSFULLY"));
         assert!(output.contains("210 OK QUIT"));
@@ -732,6 +866,7 @@ mod tests {
             "unix:///nonexistent/definitely-not-a-socket",
             Cursor::new(&b"INIT\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -745,6 +880,7 @@ mod tests {
             "tcp://127.0.0.1:1",
             Cursor::new(&b"FOO\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -821,6 +957,7 @@ mod tests {
                 &b"INIT\nSET\nvoice=male1\nsynthesis_voice=Chelsie\nlanguage=en\nrate=50\npitch=-10\nvolume=80\npitch_range=0\npunctuation_mode=none\nspelling_mode=off\ncap_let_recogn=none\n.\nQUIT\n"[..],
             ),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -836,6 +973,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nSET\nnotakeyvalue\n.\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -850,6 +988,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nSET\nbogus=1\n.\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -864,6 +1003,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nSET\nrate=fast\n.\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -892,6 +1032,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nSET\nrate=50\nbogus=1\n.\nSET\nnotakeyvalue\n.\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -910,6 +1051,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nSET\nbogus=1\nnotakeyvalue\n.\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -925,6 +1067,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nLIST VOICES\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -942,6 +1085,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nLIST VOICES\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -1076,6 +1220,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nAUDIO\naudio_output_method=server\n.\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -1091,6 +1236,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nAUDIO\naudio_output_method=local\n.\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -1105,6 +1251,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nAUDIO\nnotakeyvalue\n.\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -1121,6 +1268,7 @@ mod tests {
                 &b"INIT\nAUDIO\naudio_output_method=server\nunknown_key=value\n.\nQUIT\n"[..],
             ),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -1140,6 +1288,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nSPEAK\nhello world\n.\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -1161,6 +1310,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nSPEAK\n.\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -1175,6 +1325,7 @@ mod tests {
             "tcp://127.0.0.1:1",
             Cursor::new(&b"SPEAK\nhello\n.\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -1189,6 +1340,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nSPEAK\nhello\n.\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -1209,6 +1361,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nSPEAK\nhello\n.\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -1229,6 +1382,7 @@ mod tests {
             &uri,
             Cursor::new(&b"INIT\nSPEAK\nhi\n.\nQUIT\n"[..]),
             &mut output,
+            None,
         )
         .unwrap();
         let marker = b"705-AUDIO\0";
@@ -1243,5 +1397,174 @@ mod tests {
                 .position(|w| w == b"\n7")
                 .unwrap();
         assert_eq!(&output[start..end], &[0x7d, 0x2a, 0x7d, 0x5d, 0x03]);
+    }
+
+    #[test]
+    fn poll_fd_interrupt_detects_stop() {
+        let (mut tx, rx) = UnixStream::pair().unwrap();
+        tx.write_all(b"STOP\n").unwrap();
+        assert_eq!(poll_fd_interrupt(rx.as_fd()), Some(Interrupt::Stop));
+    }
+
+    #[test]
+    fn poll_fd_interrupt_detects_pause() {
+        let (mut tx, rx) = UnixStream::pair().unwrap();
+        tx.write_all(b"PAUSE\n").unwrap();
+        assert_eq!(poll_fd_interrupt(rx.as_fd()), Some(Interrupt::Pause));
+    }
+
+    #[test]
+    fn poll_fd_interrupt_no_data_returns_none() {
+        let (_tx, rx) = UnixStream::pair().unwrap();
+        assert_eq!(poll_fd_interrupt(rx.as_fd()), None);
+    }
+
+    #[test]
+    fn poll_fd_interrupt_unrecognized_line_returns_none() {
+        let (mut tx, rx) = UnixStream::pair().unwrap();
+        tx.write_all(b"FOO\n").unwrap();
+        assert_eq!(poll_fd_interrupt(rx.as_fd()), None);
+    }
+
+    #[test]
+    fn run_stop_when_not_speaking_replies_703() {
+        let uri = spawn_describe_server(InfoData::new());
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nSTOP\nQUIT\n"[..]),
+            &mut output,
+            None,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("703 STOP"));
+    }
+
+    #[test]
+    fn run_pause_when_not_speaking_replies_704() {
+        let uri = spawn_describe_server(InfoData::new());
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nPAUSE\nQUIT\n"[..]),
+            &mut output,
+            None,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("704 PAUSE"));
+    }
+
+    /// `input` (the command script) and `interrupt_fd` (polled for
+    /// `STOP`/`PAUSE`) are deliberately separate channels here: a
+    /// `Cursor` has no real file descriptor to poll, so the interrupt is
+    /// pre-loaded onto its own socketpair instead, simulating the case
+    /// where a `STOP`/`PAUSE` line is already sitting unread on stdin by
+    /// the time synthesis starts streaming chunks.
+    #[test]
+    fn run_speak_stop_interrupts_before_first_chunk() {
+        let format = AudioFormat {
+            rate: 24000,
+            width: 2,
+            channels: 1,
+        };
+        let uri = spawn_tts_server(
+            InfoData::new(),
+            format,
+            vec![vec![0x01, 0x02], vec![0x03, 0x04], vec![0x05, 0x06]],
+        );
+        let (mut tx, rx) = UnixStream::pair().unwrap();
+        tx.write_all(b"STOP\n").unwrap();
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nSPEAK\nhello\n.\nQUIT\n"[..]),
+            &mut output,
+            Some(rx.as_fd()),
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("701 BEGIN"));
+        assert!(output.contains("703 STOP"));
+        assert!(!output.contains("702 END"));
+        assert!(!output.contains("705 AUDIO"));
+    }
+
+    #[test]
+    fn run_speak_pause_interrupts_before_first_chunk() {
+        let format = AudioFormat {
+            rate: 24000,
+            width: 2,
+            channels: 1,
+        };
+        let uri = spawn_tts_server(
+            InfoData::new(),
+            format,
+            vec![vec![0x01, 0x02], vec![0x03, 0x04], vec![0x05, 0x06]],
+        );
+        let (mut tx, rx) = UnixStream::pair().unwrap();
+        tx.write_all(b"PAUSE\n").unwrap();
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nSPEAK\nhello\n.\nQUIT\n"[..]),
+            &mut output,
+            Some(rx.as_fd()),
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("701 BEGIN"));
+        assert!(output.contains("704 PAUSE"));
+        assert!(!output.contains("702 END"));
+        assert!(!output.contains("705 AUDIO"));
+    }
+
+    /// Calls `speak` directly with a `poll_interrupt` closure that lets
+    /// the first audio chunk through before stopping, covering the
+    /// mid-stream abort case — as opposed to the `before_first_chunk`
+    /// tests above, which interrupt before any audio is written.
+    #[test]
+    fn speak_stop_mid_stream_emits_audio_then_703() {
+        let format = AudioFormat {
+            rate: 24000,
+            width: 2,
+            channels: 1,
+        };
+        let uri = spawn_tts_server(
+            InfoData::new(),
+            format,
+            vec![vec![0x01, 0x02], vec![0x03, 0x04], vec![0x05, 0x06]],
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut client, _voices) = runtime.block_on(init(&uri)).unwrap();
+        let settings = Settings::default();
+        let mut output = Vec::new();
+        let mut calls = 0;
+        let mut poll_interrupt = || {
+            calls += 1;
+            if calls == 1 {
+                None
+            } else {
+                Some(Interrupt::Stop)
+            }
+        };
+        speak(
+            &runtime,
+            &mut client,
+            &settings,
+            "hello",
+            &mut output,
+            &mut poll_interrupt,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("701 BEGIN"));
+        assert!(output.contains("705 AUDIO"));
+        assert!(output.contains("703 STOP"));
+        assert!(!output.contains("702 END"));
     }
 }
