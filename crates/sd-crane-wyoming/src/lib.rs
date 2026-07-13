@@ -15,13 +15,14 @@ use std::io::{self, BufRead, Write};
 use std::ops::ControlFlow;
 use std::os::fd::BorrowedFd;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::Context;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{Registry, reload};
 use wyoming_protocol::event::{InfoData, SynthesizeData, SynthesizeVoice};
-use wyoming_protocol::{AudioFormat, Client, ClientError};
+use wyoming_protocol::{AudioFormat, Client, ClientError, ProtocolError};
 
 /// Reload handle for the `tracing` level filter, set once by
 /// [`init_logging`] and used by [`set_log_level`] to change verbosity in
@@ -584,34 +585,33 @@ fn handle_set(
     }
 }
 
-/// Synthesizes `text` via `client` and streams it back to `output` as
-/// `705 AUDIO` events, bracketed by `701 BEGIN`/`702 END`.
-///
-/// `Client::start_synthesis` (which sends the request and reads
-/// `audio-start`) is private, so `200 OK SPEAKING`/`701 BEGIN` can't be
-/// emitted between it and the first audio chunk directly; instead the
-/// chunk callback emits that preamble the first time it runs, and its
-/// absence afterward distinguishes "synthesis never started" (still
-/// reply `301 ERROR CANT SPEAK`) from "synthesis started but failed
-/// partway through" (audio was already delivered, so just close with
-/// `702 END`, per the mid-stream error convention documented on
-/// `Client::synthesize_streaming`).
-///
-/// `poll_interrupt` is polled once per audio piece; when it reports a
-/// `STOP`/`PAUSE`, synthesis is aborted (the chunk callback returns
-/// `ControlFlow::Break`, so `synthesize_streaming` drains and discards
-/// the remaining `audio-chunk`/`audio-stop` events itself, leaving the
-/// connection ready for the next `SPEAK`) and `703 STOP`/`704 PAUSE`
-/// is sent instead of `702 END`.
-fn speak(
+/// The outcome of one [`synthesize_attempt`] call.
+struct Attempt {
+    /// The result of the underlying `synthesize_streaming` call.
+    result: Result<AudioFormat, ClientError>,
+    /// Whether the `200 OK SPEAKING`/`701 BEGIN` preamble was already
+    /// written to `output` before `result` was known.
+    preamble_sent: bool,
+    /// Whether the server reported a zero-width or zero-channel audio
+    /// format.
+    bad_format: bool,
+    /// An I/O error writing to `output`, if one occurred.
+    io_error: Option<io::Error>,
+    /// A `STOP`/`PAUSE` observed mid-stream, if any.
+    interrupt: Option<Interrupt>,
+}
+
+/// Makes one attempt at synthesizing `synth_data` via `client`, streaming
+/// audio chunks to `output` as they arrive. Split out of [`speak`] so a
+/// failed attempt that never reached `audio-start` can be retried once
+/// against a freshly reconnected `client`.
+fn synthesize_attempt(
     rt: &tokio::runtime::Runtime,
     client: &mut Client,
-    settings: &Settings,
-    text: &str,
+    synth_data: SynthesizeData,
     output: &mut impl Write,
     poll_interrupt: &mut impl FnMut() -> Option<Interrupt>,
-) -> io::Result<()> {
-    let synth_data = settings.to_synthesize_data(text);
+) -> Attempt {
     let mut preamble_sent = false;
     let mut bad_format = false;
     let mut io_error = None;
@@ -644,6 +644,115 @@ fn speak(
         ControlFlow::Continue(())
     }));
 
+    Attempt {
+        result,
+        preamble_sent,
+        bad_format,
+        io_error,
+        interrupt,
+    }
+}
+
+/// Whether `e` indicates the connection itself is broken (as opposed to
+/// a legitimate protocol-level rejection like [`ClientError::ServerError`]
+/// or [`ClientError::UnexpectedEvent`]) — the case a reconnect can fix.
+///
+/// The Wyoming server closes idle connections after its own timeout (see
+/// `crane-wyoming`'s `IDLE_TIMEOUT`); since this module holds one
+/// `Client` connection open for its entire lifetime, a `SPEAK` arriving
+/// after such a timeout hits exactly this case.
+fn is_transport_error(e: &ClientError) -> bool {
+    matches!(
+        e,
+        ClientError::Protocol(ProtocolError::Io { .. }) | ClientError::UnexpectedEof
+    )
+}
+
+/// How long to wait for a reconnect (`Client::connect` + `describe`) to
+/// succeed before giving up, so a hung peer can't block `speak` forever
+/// with no way for `STOP` to interrupt it.
+const RECONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Synthesizes `text` via `client` and streams it back to `output` as
+/// `705 AUDIO` events, bracketed by `701 BEGIN`/`702 END`.
+///
+/// `Client::start_synthesis` (which sends the request and reads
+/// `audio-start`) is private, so `200 OK SPEAKING`/`701 BEGIN` can't be
+/// emitted between it and the first audio chunk directly; instead the
+/// chunk callback emits that preamble the first time it runs, and its
+/// absence afterward distinguishes "synthesis never started" (still
+/// reply `301 ERROR CANT SPEAK`) from "synthesis started but failed
+/// partway through" (audio was already delivered, so just close with
+/// `702 END`, per the mid-stream error convention documented on
+/// `Client::synthesize_streaming`).
+///
+/// If the first attempt fails before `audio-start` with a transport-level
+/// error (see [`is_transport_error`]), `client` is replaced with a fresh
+/// connection to `uri` and synthesis is retried once — this is what
+/// recovers a `SPEAK` sent after the server has dropped this module's
+/// long-lived connection for being idle past its own timeout.
+///
+/// `poll_interrupt` is polled once per audio piece; when it reports a
+/// `STOP`/`PAUSE`, synthesis is aborted (the chunk callback returns
+/// `ControlFlow::Break`, so `synthesize_streaming` drains and discards
+/// the remaining `audio-chunk`/`audio-stop` events itself, leaving the
+/// connection ready for the next `SPEAK`) and `703 STOP`/`704 PAUSE`
+/// is sent instead of `702 END`.
+fn speak(
+    rt: &tokio::runtime::Runtime,
+    uri: &str,
+    client: &mut Client,
+    settings: &Settings,
+    text: &str,
+    output: &mut impl Write,
+    poll_interrupt: &mut impl FnMut() -> Option<Interrupt>,
+) -> io::Result<()> {
+    let mut attempt = synthesize_attempt(
+        rt,
+        client,
+        settings.to_synthesize_data(text),
+        output,
+        poll_interrupt,
+    );
+
+    if let Err(e) = &attempt.result
+        && !attempt.preamble_sent
+        && attempt.io_error.is_none()
+        && is_transport_error(e)
+    {
+        tracing::warn!("connection lost before synthesis started ({e}), reconnecting");
+        // init() re-runs describe() as a connectivity health-check; the
+        // cached voice list is intentionally left as-is.
+        match rt.block_on(async { tokio::time::timeout(RECONNECT_TIMEOUT, init(uri)).await }) {
+            Ok(Ok((reconnected, _voices))) => {
+                *client = reconnected;
+                attempt = synthesize_attempt(
+                    rt,
+                    client,
+                    settings.to_synthesize_data(text),
+                    output,
+                    poll_interrupt,
+                );
+            },
+            Ok(Err(reconnect_err)) => {
+                tracing::warn!("reconnect failed: {reconnect_err}");
+                attempt.result = Err(reconnect_err);
+            },
+            Err(_elapsed) => {
+                tracing::warn!("reconnect timed out after {RECONNECT_TIMEOUT:?}");
+                return write_reply(output, "301 ERROR CANT SPEAK\n");
+            },
+        }
+    }
+
+    let Attempt {
+        result,
+        preamble_sent,
+        bad_format,
+        io_error,
+        interrupt,
+    } = attempt;
+
     if let Some(e) = io_error {
         return Err(e);
     }
@@ -663,7 +772,10 @@ fn speak(
             tracing::warn!("synthesis error after audio started: {e}");
             write_reply(output, "702 END\n")
         },
-        Err(_) => write_reply(output, "301 ERROR CANT SPEAK\n"),
+        Err(e) => {
+            tracing::warn!("synthesis failed: {e}");
+            write_reply(output, "301 ERROR CANT SPEAK\n")
+        },
     }
 }
 
@@ -745,6 +857,7 @@ pub fn run(
                 let mut poll_interrupt = || interrupt_fd.and_then(poll_fd_interrupt);
                 speak(
                     rt,
+                    uri,
                     connected,
                     &settings,
                     &text,
@@ -932,6 +1045,110 @@ mod tests {
                 .await
                 .unwrap();
             });
+        });
+        format!("tcp://{addr}")
+    }
+
+    /// Spawns a mock Wyoming server that simulates a server-side idle
+    /// timeout dropping the module's long-lived connection: its first
+    /// connection answers `describe`, then closes without responding to
+    /// the following `synthesize` (so the client sees a transport-level
+    /// EOF, not a protocol error); its second connection (from the
+    /// reconnect this should trigger) answers both `describe` and
+    /// `synthesize` normally, as `spawn_tts_server` does.
+    fn spawn_flaky_then_ok_server(
+        info: InfoData,
+        format: AudioFormat,
+        chunks: Vec<Vec<u8>>,
+    ) -> String {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (first, _) = listener.accept().unwrap();
+            first.set_nonblocking(true).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let first_info = info.clone();
+            runtime.block_on(async move {
+                let stream = tokio::net::TcpStream::from_std(first).unwrap();
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                read_event(&mut reader).await.unwrap();
+                write_event(&mut write_half, &Event::Info(first_info))
+                    .await
+                    .unwrap();
+                read_event(&mut reader).await.unwrap();
+                // Drop the connection instead of answering `synthesize`.
+            });
+
+            let (second, _) = listener.accept().unwrap();
+            second.set_nonblocking(true).unwrap();
+            runtime.block_on(async move {
+                let stream = tokio::net::TcpStream::from_std(second).unwrap();
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+
+                read_event(&mut reader).await.unwrap();
+                write_event(&mut write_half, &Event::Info(info))
+                    .await
+                    .unwrap();
+
+                read_event(&mut reader).await.unwrap();
+                write_event(
+                    &mut write_half,
+                    &Event::AudioStart(AudioStartData::new(format)),
+                )
+                .await
+                .unwrap();
+                for chunk in chunks {
+                    write_event(
+                        &mut write_half,
+                        &Event::AudioChunk {
+                            data: AudioChunkData::new(format),
+                            audio: chunk,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                write_event(&mut write_half, &Event::AudioStop(AudioStopData::new()))
+                    .await
+                    .unwrap();
+            });
+        });
+        format!("tcp://{addr}")
+    }
+
+    /// Spawns a mock Wyoming server that simulates a dropped idle
+    /// connection whose reconnect also fails: its one connection answers
+    /// `describe`, then closes without responding to the following
+    /// `synthesize`; the listener is then dropped, so the reconnect this
+    /// triggers gets connection-refused instead of a second server.
+    fn spawn_always_flaky_server(info: InfoData) -> String {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let stream = tokio::net::TcpStream::from_std(stream).unwrap();
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                read_event(&mut reader).await.unwrap();
+                write_event(&mut write_half, &Event::Info(info))
+                    .await
+                    .unwrap();
+                read_event(&mut reader).await.unwrap();
+                // Drop the connection instead of answering `synthesize`.
+            });
+            // Drop `listener` so the reconnect this triggers is refused
+            // rather than left hanging with no server to answer it.
         });
         format!("tcp://{addr}")
     }
@@ -1533,6 +1750,46 @@ mod tests {
     }
 
     #[test]
+    fn run_speak_reconnects_after_dropped_connection() {
+        let format = AudioFormat {
+            rate: 24000,
+            width: 2,
+            channels: 1,
+        };
+        let uri =
+            spawn_flaky_then_ok_server(InfoData::new(), format, vec![vec![0x01, 0x02, 0x03, 0x04]]);
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nSPEAK\nhello\n.\nQUIT\n"[..]),
+            &mut output,
+            None,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("701 BEGIN"));
+        assert!(output.contains("705 AUDIO"));
+        assert!(output.contains("702 END"));
+        assert!(!output.contains("301 ERROR CANT SPEAK"));
+    }
+
+    #[test]
+    fn run_speak_reconnect_fails_reports_error() {
+        let uri = spawn_always_flaky_server(InfoData::new());
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nSPEAK\nhello\n.\nQUIT\n"[..]),
+            &mut output,
+            None,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("301 ERROR CANT SPEAK"));
+        assert!(!output.contains("701 BEGIN"));
+    }
+
+    #[test]
     fn run_speak_zero_width_format_replies_error() {
         let format = AudioFormat {
             rate: 24000,
@@ -1738,6 +1995,7 @@ mod tests {
         };
         speak(
             &runtime,
+            &uri,
             &mut client,
             &settings,
             "hello",
