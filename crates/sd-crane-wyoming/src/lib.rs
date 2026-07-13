@@ -199,6 +199,9 @@ enum Command {
     Set,
     /// `AUDIO` — receive a multiline block of audio output settings.
     Audio,
+    /// `LOGLEVEL` — receive a multiline block setting the module's log
+    /// level.
+    LogLevel,
     /// `SPEAK` — receive text and synthesize it.
     Speak,
     /// `LIST VOICES` — report the voice list cached at `INIT` time.
@@ -220,6 +223,7 @@ impl Command {
             "INIT" => Self::Init,
             "SET" => Self::Set,
             "AUDIO" => Self::Audio,
+            "LOGLEVEL" => Self::LogLevel,
             "SPEAK" => Self::Speak,
             "LIST VOICES" => Self::ListVoices,
             "STOP" => Self::Stop,
@@ -466,6 +470,33 @@ fn handle_audio(
     }
 }
 
+/// Handles the `LOGLEVEL` command: reads a `key=value` block setting the
+/// module's log level.
+///
+/// speechd's `module.c` kills and unregisters the whole module if this
+/// command doesn't return a `2xx` reply, right after `AUDIO` and before
+/// ever requesting `LIST VOICES` — so this module must at least accept
+/// the command, even though it has no log-level-dependent behavior to
+/// configure. `log_level` is validated as an integer (matching speechd's
+/// own reference module) but otherwise ignored.
+///
+/// Unlike `handle_audio`, unrecognized keys are rejected here, matching
+/// `SET`'s strictness, since there is no other accepted key to be lenient
+/// about.
+fn handle_loglevel(
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    write_reply(output, "207 OK RECEIVING LOGLEVEL SETTINGS\n")?;
+    match read_kv_block(lines, |key, value| {
+        key == "log_level" && value.parse::<i32>().is_ok()
+    })? {
+        Some(BlockError::BadSyntax) => write_reply(output, "302 ERROR BAD SYNTAX\n"),
+        Some(BlockError::BadValue) => write_reply(output, "303 ERROR INVALID PARAMETER OR VALUE\n"),
+        None => write_reply(output, "203 OK LOGLEVEL SET\n"),
+    }
+}
+
 /// Handles the `SET` command: reads a `key=value` block and applies it
 /// to `settings` for the next `SPEAK`.
 ///
@@ -622,6 +653,7 @@ pub fn run(
             },
             Command::Set => handle_set(&mut lines, &mut output, &mut settings)?,
             Command::Audio => handle_audio(&mut lines, &mut output)?,
+            Command::LogLevel => handle_loglevel(&mut lines, &mut output)?,
             Command::Speak => {
                 write_reply(&mut output, "202 OK RECEIVING MESSAGE\n")?;
                 let Some(text) = read_text_block(&mut lines)? else {
@@ -1273,6 +1305,83 @@ mod tests {
         .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("203 OK AUDIO INITIALIZED"));
+    }
+
+    #[test]
+    fn run_loglevel_valid_value_replies_ok() {
+        let uri = spawn_describe_server(InfoData::new());
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nLOGLEVEL\nlog_level=5\n.\nQUIT\n"[..]),
+            &mut output,
+            None,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("207 OK RECEIVING LOGLEVEL SETTINGS"));
+        assert!(output.contains("203 OK LOGLEVEL SET"));
+    }
+
+    #[test]
+    fn run_loglevel_non_integer_value_replies_303() {
+        let uri = spawn_describe_server(InfoData::new());
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nLOGLEVEL\nlog_level=nope\n.\nQUIT\n"[..]),
+            &mut output,
+            None,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("303 ERROR INVALID PARAMETER OR VALUE"));
+    }
+
+    #[test]
+    fn run_loglevel_unknown_key_replies_303() {
+        let uri = spawn_describe_server(InfoData::new());
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nLOGLEVEL\nunknown_key=5\n.\nQUIT\n"[..]),
+            &mut output,
+            None,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("303 ERROR INVALID PARAMETER OR VALUE"));
+    }
+
+    #[test]
+    fn run_loglevel_bad_syntax_replies_302() {
+        let uri = spawn_describe_server(InfoData::new());
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nLOGLEVEL\nnotakeyvalue\n.\nQUIT\n"[..]),
+            &mut output,
+            None,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("302 ERROR BAD SYNTAX"));
+    }
+
+    #[test]
+    fn run_loglevel_bad_syntax_takes_priority_over_bad_value() {
+        let uri = spawn_describe_server(InfoData::new());
+        let mut output = Vec::new();
+        run(
+            &uri,
+            Cursor::new(&b"INIT\nLOGLEVEL\nunknown_key=5\nnotakeyvalue\n.\nQUIT\n"[..]),
+            &mut output,
+            None,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("302 ERROR BAD SYNTAX"));
+        assert!(!output.contains("303 ERROR INVALID PARAMETER OR VALUE"));
     }
 
     #[test]
