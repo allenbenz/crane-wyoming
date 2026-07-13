@@ -109,6 +109,25 @@ fn extract_voices(info: &InfoData) -> Vec<Voice> {
     voices
 }
 
+/// Unix socket path suffix under the runtime directory, matching both
+/// `cw-say`'s default and the `crane-wyoming.socket` systemd user unit's
+/// `%t/crane-wyoming/tts.sock`.
+const DEFAULT_SOCKET_SUFFIX: &str = "crane-wyoming/tts.sock";
+
+/// Computes the default Wyoming server URI used when a module config has
+/// no `CraneURI` directive.
+///
+/// Prefers a Unix socket under `xdg_runtime_dir` (`$XDG_RUNTIME_DIR` in
+/// practice); if that's unset, falls back to the same path systemd would
+/// have used for it, `/run/user/{uid}`. Taking both as parameters keeps
+/// this testable without touching process environment or real UID.
+fn default_uri(xdg_runtime_dir: Option<&str>, uid: u32) -> String {
+    match xdg_runtime_dir {
+        Some(dir) => format!("unix://{dir}/{DEFAULT_SOCKET_SUFFIX}"),
+        None => format!("unix:///run/user/{uid}/{DEFAULT_SOCKET_SUFFIX}"),
+    }
+}
+
 /// The `CraneURI` directive is present but its value isn't a quoted string.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 #[error("CraneURI directive value must be a quoted string")]
@@ -953,10 +972,13 @@ pub fn run(
 /// Parses `argv[1]` as a speechd module config path and runs the module
 /// command loop against stdin/stdout.
 ///
+/// If the config has no `CraneURI` directive, connects to the default
+/// per-user socket instead (see [`default_uri`]).
+///
 /// # Errors
 ///
 /// Returns an error if the config path is missing or unreadable, or if
-/// it has no `CraneURI` directive.
+/// a `CraneURI` directive is present but malformed.
 pub fn cli_main() -> anyhow::Result<()> {
     init_logging();
     let config_path = std::env::args()
@@ -968,7 +990,10 @@ pub fn cli_main() -> anyhow::Result<()> {
         Some(result) => {
             result.with_context(|| format!("invalid CraneURI directive in {config_path}"))?
         },
-        None => anyhow::bail!("missing CraneURI directive in {config_path}"),
+        None => default_uri(
+            std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+            rustix::process::getuid().as_raw(),
+        ),
     };
 
     let stdin = io::stdin();
@@ -1298,6 +1323,22 @@ mod tests {
     fn parse_crane_uri_requires_word_boundary() {
         let config = "CraneURITimeout \"30\"\n";
         assert_eq!(parse_crane_uri(config), None);
+    }
+
+    #[test]
+    fn default_uri_uses_xdg_runtime_dir() {
+        assert_eq!(
+            default_uri(Some("/run/user/1000"), 1000),
+            "unix:///run/user/1000/crane-wyoming/tts.sock"
+        );
+    }
+
+    #[test]
+    fn default_uri_falls_back_to_uid() {
+        assert_eq!(
+            default_uri(None, 1000),
+            "unix:///run/user/1000/crane-wyoming/tts.sock"
+        );
     }
 
     #[test]
