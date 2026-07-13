@@ -190,4 +190,5 @@ including how to scope the module to specific languages with
 
 ## License
 
-MIT
+MIT, except `crates/sd-crane-wyoming` which is LGPL-2.1-or-later (see its
+own `LICENSE` file).

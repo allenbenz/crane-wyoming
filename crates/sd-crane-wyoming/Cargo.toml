@@ -3,7 +3,7 @@ name = "sd-crane-wyoming"
 version = "0.1.0"
 description = "speech-dispatcher output module for crane-wyoming"
 edition = "2024"
-license = "MIT"
+license = "LGPL-2.1-or-later"
 repository = "https://github.com/cryptomilk/crane-wyoming"
 authors = ["Andreas Schneider <asn@cryptomilk.org>"]
 
