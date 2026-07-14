@@ -10,18 +10,23 @@ compatibility guarantees yet.
 </p>
 
 [Wyoming](https://github.com/rhasspy/wyoming) is the protocol Home Assistant
-uses to talk to local voice services (wake word, speech-to-text,
-text-to-speech, intent recognition) over the network: a JSON event header per
-message, optionally followed by a raw binary payload (e.g. PCM audio), sent
-over a TCP or Unix domain socket connection. It's how Home Assistant's local
-voice pipeline stays decoupled from whatever engine actually runs each step —
-but the protocol and this server are equally usable outside Home Assistant,
-e.g. as a desktop TTS backend for speech-dispatcher (see below).
+uses to talk to local voice services: wake word, speech-to-text,
+text-to-speech, intent recognition. It works over a network. Each message is
+a JSON event header, optionally followed by a raw binary payload (e.g. PCM
+audio). Messages are sent over a TCP or Unix domain socket connection.
 
-This repository is a Cargo workspace with three binaries built on
-[Crane](https://github.com/cryptomilk/Crane)'s TTS models:
+This is how Home Assistant's local voice pipeline stays decoupled from
+whatever engine actually runs each step. But the protocol and this server
+are equally usable outside Home Assistant, e.g. as a desktop TTS backend for
+speech-dispatcher (see below).
 
-- **`crane-wyoming`** — the Wyoming protocol server; any Wyoming client can
+This project is based on [Crane](https://github.com/cryptomilk/Crane), a
+Pure Rust based LLM, VLM, VLA, TTS, OCR Inference Engine, powering by Candle
+& Rust.
+
+It provides the following three executables:
+
+- **`crane-wyoming`** — a Wyoming protocol server; any Wyoming client can
   use a loaded Crane TTS model as its text-to-speech service, Home Assistant
   included
 - **`cw-say`** — a standalone CLI client for scripting and manual use
@@ -32,29 +37,27 @@ This repository is a Cargo workspace with three binaries built on
 
 ## Features
 
-- Wyoming service discovery (`describe`/`info`) — advertises every loaded
-  TTS model's voices to any connecting client
-- Text-to-speech synthesis (`synthesize` → `audio-start`/`audio-chunk`/
-  `audio-stop`), with true incremental audio streaming on GPU (falls back to
-  full-utterance synthesis on CPU, where streaming can't keep up with
-  real-time playback)
-- Multiple TTS models loaded at once; voice names are resolved across all of
-  them, so a client can pick any loaded voice by name
-- TCP or Unix domain socket listeners, including systemd socket activation
-- Optional on-disk cache for repeated phrases
-- speech-dispatcher integration via `sd_crane_wyoming`
+- speech-dispatcher support, bringing natural-sounding TTS to blind and
+  low-vision users, or anyone who prefers listening over reading
+- Multiple TTS models and voices at once
+- Streaming audio synthesis on GPU
+- TCP or Unix domain socket, including systemd socket activation
+- On-disk caching for repeated phrases
 
 ## Building
 
 ```bash
-cargo build --workspace --release
+cargo build --release
 ```
 
-Feature flags `cuda`, `cudnn`, `mkl` forward to the identically-named
-features on the `crane-engine` dependency, e.g.:
+Building with the `cuda` feature enables real-time incremental audio
+streaming on NVIDIA GPUs; without it, synthesis falls back to full-utterance
+generation on CPU, since CPU inference can't keep up with streaming
+playback. Feature flags `cuda`, `cudnn`, `mkl` forward to the
+identically-named features on the `crane-engine` dependency, e.g.:
 
 ```bash
-cargo build --workspace --release --features cuda
+cargo build --release --features cuda
 ```
 
 This produces three binaries under `target/release/`: `crane-wyoming`,
