@@ -60,6 +60,14 @@ identically-named features on the `crane-engine` dependency, e.g.:
 cargo build --release --features cuda
 ```
 
+On macOS, Apple Silicon (aarch64) gets Metal GPU acceleration and Intel Macs
+(x86_64) get the Accelerate BLAS automatically, since these are pulled in by
+build target rather than a Cargo feature. There are no extra flags needed:
+
+```bash
+cargo build --release
+```
+
 This produces three binaries under `target/release/`: `crane-wyoming`,
 `cw-say`, and `sd_crane_wyoming`.
 
