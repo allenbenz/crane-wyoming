@@ -19,3 +19,9 @@ jobs:
         run: cargo clippy -- -W clippy::pedantic -D warnings
       - name: Test
         run: cargo test
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
