@@ -44,6 +44,16 @@ It provides the following three executables:
 - TCP or Unix domain socket, including systemd socket activation
 - On-disk caching for repeated phrases
 
+## TODO
+
+* [x] Wyoming Protocol Crate
+* [x] Text-To-Speech (TTS) Support
+* [x] Commandline Client
++ [x] Speech Dispatcher Support
++ [ ] Automatic Speech Recognition (ASR)
++ [ ] Voice Activity Detection (VAD)
++ [ ] OpenWakeWord Support
+
 ## Building
 
 ```bash
