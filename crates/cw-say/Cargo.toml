@@ -6,6 +6,7 @@ edition = "2024"
 license = "GPL-2.0-or-later"
 repository = "https://github.com/cryptomilk/crane-wyoming"
 authors = ["Andreas Schneider <asn@cryptomilk.org>"]
+publish = false
 
 [lib]
 name = "cw_say"
