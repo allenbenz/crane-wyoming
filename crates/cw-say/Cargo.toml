@@ -3,7 +3,7 @@ name = "cw-say"
 version = "0.1.0"
 description = "Wyoming protocol TTS CLI client"
 edition = "2024"
-license = "MIT"
+license = "GPL-2.0-or-later"
 repository = "https://github.com/cryptomilk/crane-wyoming"
 authors = ["Andreas Schneider <asn@cryptomilk.org>"]
 

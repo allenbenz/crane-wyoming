@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andreas Schneider <asn@cryptomilk.org>
+
 //! Wyoming protocol TTS server for Home Assistant voice integration.
 //!
 //! # Module layout

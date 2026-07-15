@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andreas Schneider <asn@cryptomilk.org>
+//
+// Based on the `engine` module of Crane's `crane-serve` crate
+// (https://github.com/lucasjinreal/Crane), Copyright (c) 2024 Nicholas Jela,
+// licensed under the MIT License.
+
 //! Protocol-independent TTS model runtime, owned by crane-wyoming.
 //!
 //! Unlike the Crane monorepo's `crane::engine` (which also hosts the LLM

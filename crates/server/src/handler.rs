@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andreas Schneider <asn@cryptomilk.org>
+
 //! Wyoming event handler for TTS requests.
 //!
 //! Provides [`handle_connection`], an async function that runs the event

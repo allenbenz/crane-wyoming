@@ -237,5 +237,6 @@ including how to scope the module to specific languages with
 
 ## License
 
-MIT, except `crates/sd-crane-wyoming` which is LGPL-2.1-or-later (see its
-own `LICENSE` file).
+GPL-2.0-or-later, except `crates/wyoming-protocol` which is MIT and
+`crates/sd-crane-wyoming` which is LGPL-2.1-or-later (see each crate's own
+`LICENSE` file).
