@@ -71,6 +71,32 @@ cargo build --release
 This produces three binaries under `target/release/`: `crane-wyoming`,
 `cw-say`, and `sd_crane_wyoming`.
 
+## Downloading models
+
+`tools/cw-model-download` fetches TTS model weights from [Hugging
+Face](https://huggingface.co/). It's a self-contained script so
+[`uv`](https://docs.astral.sh/uv/) can run it in an ephemeral venv with no
+setup:
+
+```bash
+# List available models
+./tools/cw-model-download --list
+# or: uv run tools/cw-model-download --list
+
+# Download a model
+./tools/cw-model-download --model voxtral --path /srv/models
+```
+
+Without `uv`, install the dependency yourself and run with plain `python3`:
+
+```bash
+pip install huggingface_hub
+python3 tools/cw-model-download --list
+```
+
+Either way, this creates `/srv/models/Voxtral-4B-TTS-2603/`, which you can
+pass directly to `--model-path`.
+
 ## Running the server
 
 ```bash

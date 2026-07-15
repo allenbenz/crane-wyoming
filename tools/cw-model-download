@@ -1,0 +1,135 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["huggingface_hub"]
+# ///
+"""Download crane-wyoming TTS models from Hugging Face.
+
+Examples:
+    ./cw-model-download --list
+    ./cw-model-download --model voxtral --path /srv/models
+    ./cw-model-download --model qwen3-tts-customvoice-1.7b --path ~/models --token hf_...
+
+Run directly (uv picks up the inline metadata above and manages the
+`huggingface_hub` dependency in an ephemeral venv, no setup needed):
+
+    uv run tools/cw-model-download --list
+
+Without `uv`, install the dependency yourself and run with plain python3:
+
+    pip install huggingface_hub
+    python3 tools/cw-model-download --list
+
+huggingface_hub >= 0.32.0 bundles the `hf-xet` accelerator by default,
+which speeds up downloads automatically.
+"""
+
+import argparse
+import os
+import sys
+
+MODELS = {
+    "qwen3-tts-base": {
+        "repo_id": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        "dirname": "Qwen3-TTS-12Hz-0.6B-Base",
+        "description": "Qwen3-TTS 0.6B, voice cloning via reference audio (Apache-2.0)",
+    },
+    "qwen3-tts-customvoice-0.6b": {
+        "repo_id": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        "dirname": "Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        "description": "Qwen3-TTS 0.6B, predefined speakers (Apache-2.0)",
+    },
+    "qwen3-tts-customvoice-1.7b": {
+        "repo_id": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "dirname": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "description": "Qwen3-TTS 1.7B, predefined speakers (Apache-2.0)",
+    },
+    "voxtral": {
+        "repo_id": "mistralai/Voxtral-4B-TTS-2603",
+        "dirname": "Voxtral-4B-TTS-2603",
+        "description": "Voxtral 4B, 10 languages / 20 voices (CC-BY-NC-4.0)",
+    },
+}
+
+
+def list_models():
+    print("Available models:\n")
+    width = max(len(key) for key in MODELS)
+    for key, info in MODELS.items():
+        print(f"  {key:<{width}}  {info['description']}")
+
+
+def download_model(model_key, path, token):
+    try:
+        from huggingface_hub import snapshot_download
+        from huggingface_hub.utils import HfHubHTTPError
+    except ImportError:
+        print(
+            "error: huggingface_hub is not installed. Install it with:\n\n"
+            "    pip install huggingface_hub\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    info = MODELS[model_key]
+    local_dir = os.path.join(os.path.expanduser(path), info["dirname"])
+
+    print(f"Downloading {info['repo_id']} to {local_dir} ...")
+    try:
+        snapshot_download(repo_id=info["repo_id"], local_dir=local_dir, token=token)
+    except HfHubHTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        print(f"error: download failed: {e}", file=sys.stderr)
+        if status in (401, 403):
+            print(
+                "\nThis model may be gated. Make sure you've accepted its "
+                "license on the Hugging Face model page, then pass a valid "
+                "--token (or set HF_TOKEN).",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
+    print(f"\nDone. Use with: crane-wyoming --model-path {local_dir}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Download TTS models for crane-wyoming from Hugging Face.",
+        epilog="examples:\n"
+        "  cw-model-download --list\n"
+        "  cw-model-download --model voxtral --path /srv/models\n"
+        "  cw-model-download --model qwen3-tts-customvoice-1.7b --path ~/models --token hf_...\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--list", action="store_true", help="List available models and exit"
+    )
+    group.add_argument(
+        "--model", choices=list(MODELS.keys()), help="Model to download"
+    )
+    parser.add_argument(
+        "--path", help="Parent directory to download the model into"
+    )
+    parser.add_argument(
+        "--token",
+        help="Hugging Face auth token (prefer the HF_TOKEN env var instead, "
+        "to avoid leaking it via shell history or `ps`)",
+    )
+    args = parser.parse_args()
+
+    if args.list:
+        list_models()
+        return
+
+    if not args.path:
+        parser.error("--path is required when using --model")
+
+    download_model(args.model, args.path, args.token)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
