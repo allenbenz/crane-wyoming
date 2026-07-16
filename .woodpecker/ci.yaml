@@ -4,45 +4,15 @@ when:
     branch: ${CI_REPO_DEFAULT_BRANCH}
 
 steps:
-  restore-cache:
-    image: codeberg.org/landre/woodpecker/cache
-    settings:
-      action: download
-      bucket: cryptomilk-codeberg-s3
-      url: https://cryptomilk-codeberg-s3.nbg1.your-objectstorage.com
-      key: ${CI_REPO_NAME}-cargo-sccache
-      # Must be a path inside the repo checkout: Woodpecker only shares
-      # the git checkout workspace across all steps of a pipeline
-      # automatically -- an arbitrary absolute path like /woodpecker/.cache
-      # is *not* shared, it's private to whichever single container wrote
-      # to it (sharing anything else requires an explicit `volumes:` mount,
-      # which itself requires the repo to be marked "trusted"). CARGO_HOME/
-      # SCCACHE_DIR below must point inside this same checkout-relative
-      # `.cache` directory for restore-cache/save-cache to actually see
-      # what test/cargo-deny wrote.
-      path: .cache
-      access_key_id:
-        from_secret: s3_access_key
-      secret_access_key:
-        from_secret: s3_secret_key
-    failure: ignore
-
   test:
     image: registry.opensuse.org/home/gladiac/container/containers/codeberg-rust:latest
     environment:
       CARGO_TERM_COLOR: always
-      # Must live inside the shared checkout workspace -- see the `path`
-      # comment on restore-cache/save-cache for why.
-      CARGO_HOME: ${CI_WORKSPACE}/.cache/cargo
-      # Incremental compilation is incompatible with sccache (it produces
-      # per-session artifacts sccache can't reuse as cache entries) and
-      # buys nothing here anyway, since target/ isn't persisted between
-      # CI runs -- only CARGO_HOME/SCCACHE_DIR are.
-      CARGO_INCREMENTAL: "0"
-      SCCACHE_DIR: ${CI_WORKSPACE}/.cache/sccache
       SCCACHE_CACHE_SIZE: "1G"
       RUSTC_WRAPPER: sccache
     commands:
+      - export CARGO_HOME="`pwd`/build-cache/cargo"
+      - export SCCACHE_DIR="`pwd`/build-cache/sccache"
       - mkdir -p "$SCCACHE_DIR"
       - cargo fmt --check
       - cargo build
@@ -54,24 +24,9 @@ steps:
     image: registry.opensuse.org/home/gladiac/container/containers/codeberg-rust:latest
     environment:
       CARGO_TERM_COLOR: always
-      CARGO_HOME: ${CI_WORKSPACE}/.cache/cargo
+      SCCACHE_CACHE_SIZE: "1G"
+      RUSTC_WRAPPER: sccache
     commands:
+      - export CARGO_HOME="`pwd`/build-cache/cargo"
+      - export SCCACHE_DIR="`pwd`/build-cache/sccache"
       - cargo deny check
-
-  save-cache:
-    image: codeberg.org/landre/woodpecker/cache
-    when:
-      - event: push
-        branch: ${CI_REPO_DEFAULT_BRANCH}
-    settings:
-      action: upload
-      bucket: cryptomilk-codeberg-s3
-      url: https://cryptomilk-codeberg-s3.nbg1.your-objectstorage.com
-      key: ${CI_REPO_NAME}-cargo-sccache
-      # See restore-cache's `path` comment: must be inside the checkout
-      # workspace, matching CARGO_HOME/SCCACHE_DIR in the test step.
-      path: .cache
-      access_key_id:
-        from_secret: s3_access_key
-      secret_access_key:
-        from_secret: s3_secret_key
