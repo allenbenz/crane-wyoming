@@ -14,7 +14,7 @@
 use anyhow::Result;
 use candle_core::{DType, Device};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ─────────────────────────────────────────────────────────────
 //  Enums
@@ -72,49 +72,61 @@ struct MistralConfig {
     model_type: Option<String>,
 }
 
-/// Auto-detect the TTS model type from `config.json`/`params.json` in the
-/// model directory, falling back to a path-name heuristic.
+/// Probe whether `dir` contains a recognized TTS model, returning its
+/// type if so.
+///
+/// Only looks at `config.json`/`params.json`; unlike [`detect_model_type`],
+/// it never falls back to a path-name heuristic, so it returns `None` for
+/// directories that don't contain a recognizable model. This makes it
+/// suitable for scanning a parent directory (see [`discover_models`]),
+/// where non-model subdirectories must be silently skipped rather than
+/// misidentified.
 #[must_use]
-pub fn detect_model_type(model_path: &str) -> ModelType {
-    let path = Path::new(model_path);
-
-    let config_path = if path.is_file() {
-        path.parent().map(|p| p.join("config.json"))
-    } else {
-        Some(path.join("config.json"))
-    };
-
-    if let Some(config_path) = config_path
-        && let Ok(data) = std::fs::read(&config_path)
+pub fn probe_model_type(dir: &Path) -> Option<ModelType> {
+    let config_path = dir.join("config.json");
+    if let Ok(data) = std::fs::read(&config_path)
         && let Ok(config) = serde_json::from_slice::<HfConfig>(&data)
     {
         if let Some(ref mt) = config.model_type
             && matches!(mt.to_lowercase().as_str(), "qwen3_tts" | "qwen3tts")
         {
-            return ModelType::Qwen3TTS;
+            return Some(ModelType::Qwen3TTS);
         }
         if let Some(ref archs) = config.architectures {
             for arch in archs {
                 let a = arch.to_lowercase();
                 if a.contains("qwen3ttsforconditional") || a.contains("qwen3_tts") {
-                    return ModelType::Qwen3TTS;
+                    return Some(ModelType::Qwen3TTS);
                 }
             }
         }
     }
 
-    let params_path = if path.is_file() {
-        path.parent().map(|p| p.join("params.json"))
-    } else {
-        Some(path.join("params.json"))
-    };
-    if let Some(params_path) = params_path
-        && let Ok(data) = std::fs::read(&params_path)
+    let params_path = dir.join("params.json");
+    if let Ok(data) = std::fs::read(&params_path)
         && let Ok(config) = serde_json::from_slice::<MistralConfig>(&data)
         && let Some(ref mt) = config.model_type
         && mt == "voxtral_tts"
     {
-        return ModelType::VoxtralTTS;
+        return Some(ModelType::VoxtralTTS);
+    }
+
+    None
+}
+
+/// Auto-detect the TTS model type from `config.json`/`params.json` in the
+/// model directory, falling back to a path-name heuristic.
+#[must_use]
+pub fn detect_model_type(model_path: &str) -> ModelType {
+    let path = Path::new(model_path);
+    let dir = if path.is_file() {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
+
+    if let Some(model_type) = probe_model_type(dir) {
+        return model_type;
     }
 
     let path_lower = model_path.to_lowercase();
@@ -126,6 +138,60 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         );
         ModelType::Qwen3TTS
     }
+}
+
+/// A TTS model discovered by [`discover_models`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredModel {
+    /// Full path to the model directory.
+    pub path: PathBuf,
+    /// Directory name (the final path component), used as the model's
+    /// registration name.
+    pub name: String,
+    /// Detected model architecture.
+    pub model_type: ModelType,
+}
+
+/// Scan `parent_dir` for immediate subdirectories containing recognized
+/// TTS models.
+///
+/// Each subdirectory is probed with [`probe_model_type`]; subdirectories
+/// that don't contain a recognized model (no `config.json`/`params.json`
+/// with a known `model_type`) are silently skipped. Results are sorted
+/// alphabetically by directory name, giving deterministic default model
+/// ordering.
+///
+/// # Errors
+///
+/// Returns an error if `parent_dir` cannot be read.
+pub fn discover_models(parent_dir: &Path) -> Result<Vec<DiscoveredModel>> {
+    let entries = std::fs::read_dir(parent_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read model directory '{}': {e}",
+            parent_dir.display()
+        )
+    })?;
+
+    let mut models = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Some(model_type) = probe_model_type(&path) {
+            let name = path
+                .file_name()
+                .map_or_else(|| "tts".to_string(), |n| n.to_string_lossy().into_owned());
+            models.push(DiscoveredModel {
+                path,
+                name,
+                model_type,
+            });
+        }
+    }
+
+    models.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(models)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -283,5 +349,125 @@ mod tests {
             panic!("expected create_tts to reject ModelType::Auto");
         };
         assert!(err.to_string().contains("must be resolved"));
+    }
+
+    // ── probe_model_type ──
+
+    #[test]
+    fn probe_from_config_json_qwen3_tts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "qwen3_tts"}"#,
+        )
+        .unwrap();
+        assert_eq!(probe_model_type(dir.path()), Some(ModelType::Qwen3TTS));
+    }
+
+    #[test]
+    fn probe_from_params_json_voxtral() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("params.json"),
+            r#"{"model_type": "voxtral_tts"}"#,
+        )
+        .unwrap();
+        assert_eq!(probe_model_type(dir.path()), Some(ModelType::VoxtralTTS));
+    }
+
+    #[test]
+    fn probe_empty_dir_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(probe_model_type(dir.path()), None);
+    }
+
+    #[test]
+    fn probe_unrecognized_config_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "unknown"}"#,
+        )
+        .unwrap();
+        assert_eq!(probe_model_type(dir.path()), None);
+    }
+
+    #[test]
+    fn probe_path_heuristic_not_used() {
+        // No config files exist here, so unlike `detect_model_type`, the
+        // "voxtral" substring in the path must not cause a match.
+        assert_eq!(
+            probe_model_type(Path::new("/nonexistent/Voxtral-4B-TTS-2603")),
+            None
+        );
+    }
+
+    // ── discover_models ──
+
+    #[test]
+    fn discover_models_finds_both_types() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("qwen")).unwrap();
+        std::fs::write(
+            dir.path().join("qwen/config.json"),
+            r#"{"model_type": "qwen3_tts"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("voxtral")).unwrap();
+        std::fs::write(
+            dir.path().join("voxtral/params.json"),
+            r#"{"model_type": "voxtral_tts"}"#,
+        )
+        .unwrap();
+
+        let models = discover_models(dir.path()).unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].name, "qwen");
+        assert_eq!(models[0].model_type, ModelType::Qwen3TTS);
+        assert_eq!(models[1].name, "voxtral");
+        assert_eq!(models[1].model_type, ModelType::VoxtralTTS);
+    }
+
+    #[test]
+    fn discover_models_skips_non_model_dirs_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("readme.txt"), "hello").unwrap();
+        std::fs::create_dir(dir.path().join("model")).unwrap();
+        std::fs::write(
+            dir.path().join("model/config.json"),
+            r#"{"model_type": "qwen3_tts"}"#,
+        )
+        .unwrap();
+
+        let models = discover_models(dir.path()).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "model");
+    }
+
+    #[test]
+    fn discover_models_sorted_alphabetically() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["c", "a", "b"] {
+            let sub = dir.path().join(name);
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(sub.join("config.json"), r#"{"model_type": "qwen3_tts"}"#).unwrap();
+        }
+
+        let models = discover_models(dir.path()).unwrap();
+        let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn discover_models_empty_dir_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(discover_models(dir.path()).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn discover_models_nonexistent_dir_errors() {
+        let result = discover_models(Path::new("/nonexistent/parent/dir"));
+        assert!(result.is_err());
     }
 }

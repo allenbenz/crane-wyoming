@@ -36,17 +36,25 @@ use crate::engine::ModelRuntime;
 #[derive(Parser, Debug, Clone)]
 #[command(about = "Wyoming protocol TTS server for Home Assistant voice integration")]
 pub struct Args {
-    /// Path to a TTS model directory. Separate multiple paths with `;` to
-    /// load multiple models; the first path becomes the default voice when
-    /// a client does not request one by name.
+    /// Parent directory containing TTS model subdirectories. All recognized
+    /// models found as immediate subdirectories are loaded, unless
+    /// restricted with `--model`. The first loaded model (alphabetically,
+    /// or by `--model` order if given) becomes the default voice when a
+    /// client does not request one by name.
     #[arg(
         short = 'm',
         long = "model-path",
         required = true,
-        env = "CRANE_WYOMING_MODEL_PATH",
-        value_delimiter = ';'
+        env = "CRANE_WYOMING_MODEL_PATH"
     )]
-    pub model_path: Vec<PathBuf>,
+    pub model_path: PathBuf,
+
+    /// Load only the named model subdirectories from `--model-path`
+    /// (directory name, not full path). Repeatable, or separate multiple
+    /// names with `;`; order determines voice priority (first = default).
+    /// When omitted, all recognized models are loaded alphabetically.
+    #[arg(long = "model", env = "CRANE_WYOMING_MODEL", value_delimiter = ';')]
+    pub model: Vec<String>,
 
     /// TCP port to listen on.
     #[arg(short = 'p', long, default_value_t = 10200, env = "CRANE_WYOMING_PORT")]
@@ -415,16 +423,19 @@ async fn serve_connection(
 
 /// Run the Wyoming protocol TTS server.
 ///
-/// Loads each `--model-path` into a shared [`ModelRuntime`], optionally enables
-/// the on-disk TTS cache, then accepts connections on the address resolved
-/// from `--uri` (or `args.host`:`args.port` if unset) -- either TCP or a
-/// Unix domain socket. Each connection is handled on its own tokio task via
-/// [`handle_connection`]; TTS requests from all connections queue on the
-/// target model's dedicated thread and are processed one at a time.
+/// Discovers TTS models under `--model-path` (optionally restricted by
+/// `--model`) and loads them into a shared [`ModelRuntime`], optionally
+/// enables the on-disk TTS cache, then accepts connections on the address
+/// resolved from `--uri` (or `args.host`:`args.port` if unset) -- either TCP
+/// or a Unix domain socket. Each connection is handled on its own tokio
+/// task via [`handle_connection`]; TTS requests from all connections queue
+/// on the target model's dedicated thread and are processed one at a time.
 ///
 /// # Errors
 ///
-/// Returns an error if a model fails to load or the listener cannot bind.
+/// Returns an error if no supported models are found, a named `--model`
+/// doesn't match a discovered model, a model fails to load, or the
+/// listener cannot bind.
 pub async fn run(args: Args) -> Result<()> {
     let device = if args.cpu {
         crane_core::models::Device::Cpu
@@ -466,9 +477,34 @@ pub async fn run(args: Args) -> Result<()> {
     let dtype_name = format!("{dtype:?}");
     info!("Device: {device_name}, dtype: {dtype_name}, streaming: {streaming_enabled}");
 
-    if args.model_path.is_empty() {
-        anyhow::bail!("at least one --model-path is required");
+    let discovered = engine::model_factory::discover_models(&args.model_path)?;
+    if discovered.is_empty() {
+        anyhow::bail!(
+            "no supported TTS models found in '{}'",
+            args.model_path.display()
+        );
     }
+
+    // When `--model` is given, load exactly those (in the given order, so
+    // the first one named becomes the default); otherwise load everything
+    // discovered, in alphabetical order.
+    let models_to_load: Vec<&engine::model_factory::DiscoveredModel> = if args.model.is_empty() {
+        discovered.iter().collect()
+    } else {
+        args.model
+            .iter()
+            .map(|name| {
+                discovered.iter().find(|m| &m.name == name).ok_or_else(|| {
+                    let available: Vec<&str> = discovered.iter().map(|m| m.name.as_str()).collect();
+                    anyhow::anyhow!(
+                        "model '{name}' not found in '{}'; available: {}",
+                        args.model_path.display(),
+                        available.join(", ")
+                    )
+                })
+            })
+            .collect::<Result<_>>()?
+    };
 
     // Resolved before model loading so `systemd_listen_fd`'s env-var cleanup
     // (see its doc comment) runs while this process is still single-threaded,
@@ -494,9 +530,9 @@ pub async fn run(args: Args) -> Result<()> {
         info!(dir = %cache_dir.display(), max = %args.tts_cache_max_size, "TTS cache enabled");
     }
 
-    let mut model_names = Vec::with_capacity(args.model_path.len());
-    for model_path in &args.model_path {
-        let path_str = model_path.to_string_lossy();
+    let mut model_names = Vec::with_capacity(models_to_load.len());
+    for model in &models_to_load {
+        let path_str = model.path.to_string_lossy();
         let name = runtime.load_tts(&path_str, &device, &dtype)?;
         info!(name = %name, path = %path_str, "TTS model loaded");
         model_names.push(name);
@@ -919,7 +955,8 @@ mod tests {
 
     fn args_with_uri(uri: &str) -> Args {
         Args {
-            model_path: vec![],
+            model_path: PathBuf::from("/nonexistent"),
+            model: vec![],
             port: 10200,
             host: "0.0.0.0".into(),
             uri: Some(uri.to_string()),
