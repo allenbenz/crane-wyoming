@@ -11,14 +11,15 @@ steps:
       bucket: cryptomilk-codeberg-s3
       url: https://cryptomilk-codeberg-s3.nbg1.your-objectstorage.com
       key: ${CI_REPO_NAME}-cargo-sccache
-      # Must be relative to this plugin's own WORKDIR (/woodpecker, see its
-      # Dockerfile), not the absolute /woodpecker/.cache: on upload, tar
-      # strips the leading `/` from an absolute path before archiving, so
-      # on download the archive's now-relative `woodpecker/.cache/...`
-      # entries get extracted relative to CWD (also /woodpecker),
-      # landing at the doubled /woodpecker/woodpecker/.cache/... instead
-      # of /woodpecker/.cache/... -- silently leaving the cache empty at
-      # the path the test/cargo-deny steps actually look for it at.
+      # Must be a path inside the repo checkout: Woodpecker only shares
+      # the git checkout workspace across all steps of a pipeline
+      # automatically -- an arbitrary absolute path like /woodpecker/.cache
+      # is *not* shared, it's private to whichever single container wrote
+      # to it (sharing anything else requires an explicit `volumes:` mount,
+      # which itself requires the repo to be marked "trusted"). CARGO_HOME/
+      # SCCACHE_DIR below must point inside this same checkout-relative
+      # `.cache` directory for restore-cache/save-cache to actually see
+      # what test/cargo-deny wrote.
       path: .cache
       access_key_id:
         from_secret: s3_access_key
@@ -30,13 +31,15 @@ steps:
     image: registry.opensuse.org/home/gladiac/container/containers/codeberg-rust:latest
     environment:
       CARGO_TERM_COLOR: always
-      CARGO_HOME: /woodpecker/.cache/cargo
+      # Must live inside the shared checkout workspace -- see the `path`
+      # comment on restore-cache/save-cache for why.
+      CARGO_HOME: ${CI_WORKSPACE}/.cache/cargo
       # Incremental compilation is incompatible with sccache (it produces
       # per-session artifacts sccache can't reuse as cache entries) and
       # buys nothing here anyway, since target/ isn't persisted between
       # CI runs -- only CARGO_HOME/SCCACHE_DIR are.
       CARGO_INCREMENTAL: "0"
-      SCCACHE_DIR: /woodpecker/.cache/sccache
+      SCCACHE_DIR: ${CI_WORKSPACE}/.cache/sccache
       SCCACHE_CACHE_SIZE: "1G"
       RUSTC_WRAPPER: sccache
     commands:
@@ -51,7 +54,7 @@ steps:
     image: registry.opensuse.org/home/gladiac/container/containers/codeberg-rust:latest
     environment:
       CARGO_TERM_COLOR: always
-      CARGO_HOME: /woodpecker/.cache/cargo
+      CARGO_HOME: ${CI_WORKSPACE}/.cache/cargo
     commands:
       - cargo deny check
 
@@ -65,9 +68,8 @@ steps:
       bucket: cryptomilk-codeberg-s3
       url: https://cryptomilk-codeberg-s3.nbg1.your-objectstorage.com
       key: ${CI_REPO_NAME}-cargo-sccache
-      # See restore-cache's `path` comment: must match (relative to this
-      # plugin's own WORKDIR) or the two steps silently disagree on where
-      # the cache actually lives.
+      # See restore-cache's `path` comment: must be inside the checkout
+      # workspace, matching CARGO_HOME/SCCACHE_DIR in the test step.
       path: .cache
       access_key_id:
         from_secret: s3_access_key
