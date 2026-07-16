@@ -23,6 +23,11 @@ steps:
     environment:
       CARGO_TERM_COLOR: always
       CARGO_HOME: /woodpecker/.cache/cargo
+      # Incremental compilation is incompatible with sccache (it produces
+      # per-session artifacts sccache can't reuse as cache entries) and
+      # buys nothing here anyway, since target/ isn't persisted between
+      # CI runs -- only CARGO_HOME/SCCACHE_DIR are.
+      CARGO_INCREMENTAL: "0"
       SCCACHE_DIR: /woodpecker/.cache/sccache
       SCCACHE_CACHE_SIZE: "1G"
       RUSTC_WRAPPER: sccache
