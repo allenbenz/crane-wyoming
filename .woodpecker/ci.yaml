@@ -1,0 +1,24 @@
+when:
+  - event: pull_request
+  - event: push
+    branch: ${CI_REPO_DEFAULT_BRANCH}
+
+steps:
+  test:
+    image: rust
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - rustup component add rustfmt clippy
+      - cargo fmt --check
+      - cargo build --release
+      - cargo clippy -- -W clippy::pedantic -D warnings
+      - cargo test
+
+  cargo-deny:
+    image: rust
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - cargo install --locked cargo-deny
+      - cargo deny check
