@@ -10,6 +10,7 @@ steps:
       action: download
       bucket: cryptomilk-codeberg-s3
       url: https://cryptomilk-codeberg-s3.nbg1.your-objectstorage.com
+      key: ${CI_REPO_NAME}-cargo-sccache
       path: /woodpecker/.cache
       access_key_id:
         from_secret: s3_access_key
@@ -50,6 +51,7 @@ steps:
       action: upload
       bucket: cryptomilk-codeberg-s3
       url: https://cryptomilk-codeberg-s3.nbg1.your-objectstorage.com
+      key: ${CI_REPO_NAME}-cargo-sccache
       path: /woodpecker/.cache
       access_key_id:
         from_secret: s3_access_key
