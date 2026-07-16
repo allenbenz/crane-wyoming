@@ -56,6 +56,11 @@ pub struct Args {
     #[arg(long = "model", env = "CRANE_WYOMING_MODEL", value_delimiter = ';')]
     pub model: Vec<String>,
 
+    /// List the models recognized under `--model-path` and exit, without
+    /// starting the server.
+    #[arg(long = "list-models")]
+    pub list_models: bool,
+
     /// TCP port to listen on.
     #[arg(short = 'p', long, default_value_t = 10200, env = "CRANE_WYOMING_PORT")]
     pub port: u16,
@@ -421,15 +426,33 @@ async fn serve_connection(
     }
 }
 
+/// Print the models [`engine::model_factory::discover_models`] found under
+/// `model_path`, for `--list-models`.
+fn print_discovered_models(
+    model_path: &std::path::Path,
+    discovered: &[engine::model_factory::DiscoveredModel],
+) {
+    if discovered.is_empty() {
+        println!("No supported models found in '{}'", model_path.display());
+        return;
+    }
+    println!("Models in '{}':\n", model_path.display());
+    for m in discovered {
+        println!("  {}  ({})", m.name, m.model_type.display_name());
+    }
+}
+
 /// Run the Wyoming protocol TTS server.
 ///
 /// Discovers TTS models under `--model-path` (optionally restricted by
-/// `--model`) and loads them into a shared [`ModelRuntime`], optionally
-/// enables the on-disk TTS cache, then accepts connections on the address
-/// resolved from `--uri` (or `args.host`:`args.port` if unset) -- either TCP
-/// or a Unix domain socket. Each connection is handled on its own tokio
-/// task via [`handle_connection`]; TTS requests from all connections queue
-/// on the target model's dedicated thread and are processed one at a time.
+/// `--model`). If `--list-models` is set, prints the discovered models and
+/// returns without starting the server. Otherwise loads them into a shared
+/// [`ModelRuntime`], optionally enables the on-disk TTS cache, then accepts
+/// connections on the address resolved from `--uri` (or
+/// `args.host`:`args.port` if unset) -- either TCP or a Unix domain socket.
+/// Each connection is handled on its own tokio task via
+/// [`handle_connection`]; TTS requests from all connections queue on the
+/// target model's dedicated thread and are processed one at a time.
 ///
 /// # Errors
 ///
@@ -437,6 +460,20 @@ async fn serve_connection(
 /// doesn't match a discovered model, a model fails to load, or the
 /// listener cannot bind.
 pub async fn run(args: Args) -> Result<()> {
+    let discovered = engine::model_factory::discover_models(&args.model_path)?;
+
+    if args.list_models {
+        print_discovered_models(&args.model_path, &discovered);
+        return Ok(());
+    }
+
+    if discovered.is_empty() {
+        anyhow::bail!(
+            "no supported TTS models found in '{}'",
+            args.model_path.display()
+        );
+    }
+
     let device = if args.cpu {
         crane_core::models::Device::Cpu
     } else {
@@ -476,14 +513,6 @@ pub async fn run(args: Args) -> Result<()> {
     let device_name = format!("{device:?}");
     let dtype_name = format!("{dtype:?}");
     info!("Device: {device_name}, dtype: {dtype_name}, streaming: {streaming_enabled}");
-
-    let discovered = engine::model_factory::discover_models(&args.model_path)?;
-    if discovered.is_empty() {
-        anyhow::bail!(
-            "no supported TTS models found in '{}'",
-            args.model_path.display()
-        );
-    }
 
     // When `--model` is given, load exactly those (in the given order, so
     // the first one named becomes the default); otherwise load everything
@@ -957,6 +986,7 @@ mod tests {
         Args {
             model_path: PathBuf::from("/nonexistent"),
             model: vec![],
+            list_models: false,
             port: 10200,
             host: "0.0.0.0".into(),
             uri: Some(uri.to_string()),

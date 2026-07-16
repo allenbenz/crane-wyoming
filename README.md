@@ -117,9 +117,11 @@ directory (`/srv/models`) to `--model-path`.
 subdirectories; every recognized model found there is loaded, with the
 first one (alphabetically) becoming the default voice when a client
 doesn't request one by name. Use `--model <name>` (repeatable) to load only
-specific models, in which case the first one named is the default. Use
-`--uri tcp://host:port` (or plain `--host`/`--port`, default
-`0.0.0.0:10200`) to listen on TCP instead of a Unix socket. See
+specific models, in which case the first one named is the default. Run
+`crane-wyoming --model-path models --list-models` to see which
+subdirectories are recognized and what `--model` expects, without starting
+the server. Use `--uri tcp://host:port` (or plain `--host`/`--port`,
+default `0.0.0.0:10200`) to listen on TCP instead of a Unix socket. See
 `crane-wyoming --help` for the rest of the flags (`--cpu`, `--max-connections`,
 `--tts-cache-dir`/`--tts-cache-max-size`).
 

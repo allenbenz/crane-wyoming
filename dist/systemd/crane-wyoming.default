@@ -12,7 +12,8 @@
 
 # Optional: restrict which model subdirectories under CRANE_WYOMING_MODEL_PATH
 # are loaded, separated by ';'. Order determines voice priority (first =
-# default). Omit to load every recognized model.
+# default). Omit to load every recognized model. Run
+# `crane-wyoming --model-path <dir> --list-models` to see what's available.
 #CRANE_WYOMING_MODEL=Voxtral-4B-TTS-2603;Qwen3-TTS-12Hz-0.6B-Base
 
 # TCP port to listen on (default: 10200).
