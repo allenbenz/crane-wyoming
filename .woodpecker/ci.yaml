@@ -24,7 +24,7 @@ steps:
       CARGO_TERM_COLOR: always
       CARGO_HOME: /woodpecker/.cache/cargo
       SCCACHE_DIR: /woodpecker/.cache/sccache
-      SCCACHE_CACHE_SIZE: "500M"
+      SCCACHE_CACHE_SIZE: "1G"
       RUSTC_WRAPPER: sccache
     commands:
       - mkdir -p "$SCCACHE_DIR"
