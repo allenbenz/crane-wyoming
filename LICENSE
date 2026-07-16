@@ -336,3 +336,21 @@ proprietary programs.  If your program is a subroutine library, you may
 consider it more useful to permit linking proprietary applications with the
 library.  If this is what you want to do, use the GNU Lesser General
 Public License instead of this License.
+
+────────────────────────────────────────────────────────────────────
+
+                        ADDITIONAL PERMISSION
+
+As a special exception to the terms of the GNU General Public License,
+the copyright holders of crane-wyoming give you permission to link
+crane-wyoming, or a modified version of it, with the Intel(R) Math
+Kernel Library ("Intel MKL"), distributed under the terms of the Intel
+Simplified Software License, and to convey the resulting work. You
+must still comply with the terms of the GNU General Public License in
+all respects for all of the code used other than Intel MKL, and you
+must still comply with the terms of the Intel Simplified Software
+License for Intel MKL itself.
+
+If you modify crane-wyoming, you may extend this exception to your
+version, but you are not obligated to do so. If you do not wish to do
+so, delete this exception statement from your version.

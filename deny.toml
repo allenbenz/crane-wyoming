@@ -34,6 +34,18 @@ allow = [
     "Zlib",
     "LGPL-2.1-or-later",
     "GPL-2.0-or-later",
+    # Only reachable through the optional `mkl` feature; see the
+    # additional-permission clause in LICENSE for the linking exception.
+    "LicenseRef-Intel-Simplified-Software-License",
+]
+
+# intel-mkl-src has no SPDX `license` field; it redistributes Intel MKL
+# under the proprietary Intel Simplified Software License (License.txt).
+[[licenses.clarify]]
+crate = "intel-mkl-src"
+expression = "LicenseRef-Intel-Simplified-Software-License"
+license-files = [
+    { path = "License.txt", hash = 0x3bf8c2d0 },
 ]
 
 # ── Bans ───────────────────────────────────────────────────────
