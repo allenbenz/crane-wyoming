@@ -26,11 +26,12 @@ pub use wyoming_protocol::wire::{
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::{info, warn};
 
 use crate::engine::ModelRuntime;
+use crate::engine::model_factory::DiscoveredModel;
 
 /// Command-line arguments for the Wyoming protocol TTS server.
 #[derive(Parser, Debug, Clone)]
@@ -457,8 +458,8 @@ fn print_discovered_models(
 /// # Errors
 ///
 /// Returns an error if no supported models are found, a named `--model`
-/// doesn't match a discovered model, a model fails to load, or the
-/// listener cannot bind.
+/// doesn't match a discovered model or is repeated, a model fails to load,
+/// or the listener cannot bind.
 pub async fn run(args: Args) -> Result<()> {
     let discovered = engine::model_factory::discover_models(&args.model_path)?;
 
@@ -517,23 +518,9 @@ pub async fn run(args: Args) -> Result<()> {
     // When `--model` is given, load exactly those (in the given order, so
     // the first one named becomes the default); otherwise load everything
     // discovered, in alphabetical order.
-    let models_to_load: Vec<&engine::model_factory::DiscoveredModel> = if args.model.is_empty() {
-        discovered.iter().collect()
-    } else {
-        args.model
-            .iter()
-            .map(|name| {
-                discovered.iter().find(|m| &m.name == name).ok_or_else(|| {
-                    let available: Vec<&str> = discovered.iter().map(|m| m.name.as_str()).collect();
-                    anyhow::anyhow!(
-                        "model '{name}' not found in '{}'; available: {}",
-                        args.model_path.display(),
-                        available.join(", ")
-                    )
-                })
-            })
-            .collect::<Result<_>>()?
-    };
+    let models_to_load: Vec<&DiscoveredModel> =
+        engine::model_factory::resolve_models_to_load(&discovered, &args.model)
+            .with_context(|| format!("in '{}'", args.model_path.display()))?;
 
     // Resolved before model loading so `systemd_listen_fd`'s env-var cleanup
     // (see its doc comment) runs while this process is still single-threaded,

@@ -11,7 +11,7 @@
 //! fields (Qwen3-TTS) or `params.json`'s `model_type` field (Voxtral-TTS), or
 //! explicit model type specification via CLI.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use candle_core::{DType, Device};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -141,7 +141,7 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
 }
 
 /// A TTS model discovered by [`discover_models`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct DiscoveredModel {
     /// Full path to the model directory.
     pub path: PathBuf,
@@ -174,9 +174,16 @@ pub fn discover_models(parent_dir: &Path) -> Result<Vec<DiscoveredModel>> {
 
     let mut models = Vec::new();
     for entry in entries {
-        let path = entry?.path();
-        if !path.is_dir() {
-            continue;
+        let path = entry
+            .with_context(|| format!("cannot read entry in '{}'", parent_dir.display()))?
+            .path();
+        match path.metadata() {
+            Ok(meta) if meta.is_dir() => {},
+            Ok(_) => continue, // not a directory: silently skip, e.g. stray files
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cannot stat entry; skipping");
+                continue;
+            },
         }
         if let Some(model_type) = probe_model_type(&path) {
             let name = path
@@ -192,6 +199,45 @@ pub fn discover_models(parent_dir: &Path) -> Result<Vec<DiscoveredModel>> {
 
     models.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(models)
+}
+
+/// Resolve the `--model` names an operator requested against the models
+/// [`discover_models`] found under `--model-path`.
+///
+/// If `requested` is empty, every model in `discovered` is returned (in its
+/// existing, alphabetical order). Otherwise, exactly the named models are
+/// returned, in `requested`'s order -- so the first name given becomes the
+/// default voice.
+///
+/// # Errors
+///
+/// Returns an error if a requested name doesn't match any discovered model,
+/// or if the same name is requested more than once (which would otherwise
+/// load and register the same model twice under one name).
+pub fn resolve_models_to_load<'a>(
+    discovered: &'a [DiscoveredModel],
+    requested: &[String],
+) -> Result<Vec<&'a DiscoveredModel>> {
+    if requested.is_empty() {
+        return Ok(discovered.iter().collect());
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(requested.len());
+    let mut resolved = Vec::with_capacity(requested.len());
+    for name in requested {
+        if !seen.insert(name.as_str()) {
+            anyhow::bail!("model '{name}' specified more than once in --model");
+        }
+        let model = discovered.iter().find(|m| &m.name == name).ok_or_else(|| {
+            let available: Vec<&str> = discovered.iter().map(|m| m.name.as_str()).collect();
+            anyhow::anyhow!(
+                "model '{name}' not found; available: {}",
+                available.join(", ")
+            )
+        })?;
+        resolved.push(model);
+    }
+    Ok(resolved)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -469,5 +515,86 @@ mod tests {
     fn discover_models_nonexistent_dir_errors() {
         let result = discover_models(Path::new("/nonexistent/parent/dir"));
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_models_follows_symlinked_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-model");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("config.json"), r#"{"model_type": "qwen3_tts"}"#).unwrap();
+
+        let link = dir.path().join("linked-model");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let models = discover_models(dir.path()).unwrap();
+        let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["linked-model", "real-model"]);
+    }
+
+    // ── resolve_models_to_load ──
+
+    fn discovered_fixture() -> Vec<DiscoveredModel> {
+        vec![
+            DiscoveredModel {
+                path: PathBuf::from("/models/alpha"),
+                name: "alpha".to_string(),
+                model_type: ModelType::Qwen3TTS,
+            },
+            DiscoveredModel {
+                path: PathBuf::from("/models/beta"),
+                name: "beta".to_string(),
+                model_type: ModelType::VoxtralTTS,
+            },
+            DiscoveredModel {
+                path: PathBuf::from("/models/gamma"),
+                name: "gamma".to_string(),
+                model_type: ModelType::Qwen3TTS,
+            },
+        ]
+    }
+
+    #[test]
+    fn resolve_models_to_load_empty_requested_returns_all() {
+        let discovered = discovered_fixture();
+        let resolved = resolve_models_to_load(&discovered, &[]).unwrap();
+        let names: Vec<&str> = resolved.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn resolve_models_to_load_single_match() {
+        let discovered = discovered_fixture();
+        let requested = vec!["beta".to_string()];
+        let resolved = resolve_models_to_load(&discovered, &requested).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "beta");
+    }
+
+    #[test]
+    fn resolve_models_to_load_custom_order() {
+        let discovered = discovered_fixture();
+        let requested = vec!["gamma".to_string(), "alpha".to_string()];
+        let resolved = resolve_models_to_load(&discovered, &requested).unwrap();
+        let names: Vec<&str> = resolved.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["gamma", "alpha"]);
+    }
+
+    #[test]
+    fn resolve_models_to_load_unknown_name_errors() {
+        let discovered = discovered_fixture();
+        let requested = vec!["nope".to_string()];
+        let err = resolve_models_to_load(&discovered, &requested).unwrap_err();
+        assert!(err.to_string().contains("nope"));
+        assert!(err.to_string().contains("alpha, beta, gamma"));
+    }
+
+    #[test]
+    fn resolve_models_to_load_duplicate_name_errors() {
+        let discovered = discovered_fixture();
+        let requested = vec!["alpha".to_string(), "alpha".to_string()];
+        let err = resolve_models_to_load(&discovered, &requested).unwrap_err();
+        assert!(err.to_string().contains("more than once"));
     }
 }
