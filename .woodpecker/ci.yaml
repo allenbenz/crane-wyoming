@@ -11,7 +11,15 @@ steps:
       bucket: cryptomilk-codeberg-s3
       url: https://cryptomilk-codeberg-s3.nbg1.your-objectstorage.com
       key: ${CI_REPO_NAME}-cargo-sccache
-      path: /woodpecker/.cache
+      # Must be relative to this plugin's own WORKDIR (/woodpecker, see its
+      # Dockerfile), not the absolute /woodpecker/.cache: on upload, tar
+      # strips the leading `/` from an absolute path before archiving, so
+      # on download the archive's now-relative `woodpecker/.cache/...`
+      # entries get extracted relative to CWD (also /woodpecker),
+      # landing at the doubled /woodpecker/woodpecker/.cache/... instead
+      # of /woodpecker/.cache/... -- silently leaving the cache empty at
+      # the path the test/cargo-deny steps actually look for it at.
+      path: .cache
       access_key_id:
         from_secret: s3_access_key
       secret_access_key:
@@ -37,7 +45,7 @@ steps:
       - cargo build
       - cargo clippy -- -W clippy::pedantic -D warnings
       - cargo test
-      - sccache -s
+      - sccache --show-stats
 
   cargo-deny:
     image: registry.opensuse.org/home/gladiac/container/containers/codeberg-rust:latest
@@ -57,7 +65,10 @@ steps:
       bucket: cryptomilk-codeberg-s3
       url: https://cryptomilk-codeberg-s3.nbg1.your-objectstorage.com
       key: ${CI_REPO_NAME}-cargo-sccache
-      path: /woodpecker/.cache
+      # See restore-cache's `path` comment: must match (relative to this
+      # plugin's own WORKDIR) or the two steps silently disagree on where
+      # the cache actually lives.
+      path: .cache
       access_key_id:
         from_secret: s3_access_key
       secret_access_key:
