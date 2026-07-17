@@ -201,7 +201,9 @@ echo "Hello" | cw-say | pw-play -
 - `--format` — `wav` (default) or `raw` (bare PCM)
 - `--list-voices` / `--list-languages` — query the server's `describe`
   response and exit, without synthesizing
-- `--timeout` — seconds to wait for a server response (default 30)
+- `--timeout` — seconds to wait for a server response; omit for no timeout
+  (the default), since CPU-only synthesis of long text can take much longer
+  than any reasonable fixed bound
 
 ## speech-dispatcher integration
 

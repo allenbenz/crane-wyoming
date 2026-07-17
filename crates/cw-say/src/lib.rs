@@ -8,6 +8,7 @@
 //! voices/languages. Depends only on `wyoming-protocol`.
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::io::{self, Read, Write};
 use std::ops::ControlFlow;
 use std::time::Duration;
@@ -21,6 +22,14 @@ use wyoming_protocol::{AudioFormat, Client, SynthesizeResponse};
 const DEFAULT_SOCKET_SUFFIX: &str = "crane-wyoming/tts.sock";
 /// Fallback URI used when `$XDG_RUNTIME_DIR` is not set.
 const DEFAULT_TCP_URI: &str = "tcp://127.0.0.1:10200";
+/// Timeout applied to the connection attempt when `--timeout` is not given.
+///
+/// Unlike synthesis, which has no default timeout (see [`Args::timeout`])
+/// because CPU-only generation can legitimately take minutes, connecting to
+/// a local Unix socket or LAN TCP server is expected to be near-instant, so
+/// an unreachable/misconfigured `--uri` should fail promptly by default
+/// instead of hanging forever.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Output audio format for synthesized speech.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -69,9 +78,11 @@ struct Args {
     #[arg(long)]
     list_languages: bool,
 
-    /// Seconds to wait for a server response before giving up.
-    #[arg(long, default_value_t = 30.0)]
-    timeout: f64,
+    /// Seconds to wait for a server response before giving up. Omit for no
+    /// timeout, which is the default since CPU-only synthesis of long text
+    /// can take much longer than any reasonable fixed bound.
+    #[arg(long)]
+    timeout: Option<f64>,
 }
 
 /// Computes the default Wyoming server URI.
@@ -299,6 +310,53 @@ fn write_response_to_file(
     Ok(())
 }
 
+/// Maps the `--timeout` CLI value to a [`Duration`].
+///
+/// `None` (the flag omitted) means no timeout. Non-finite values (`inf`,
+/// `nan`) -- which `Duration::from_secs_f64` would otherwise panic on --
+/// are also treated as "no timeout" rather than rejected, since a user
+/// passing `--timeout inf` is clearly trying to express the same thing.
+/// Negative values are clamped to zero.
+fn resolve_timeout(timeout: Option<f64>) -> Option<Duration> {
+    let timeout = timeout?;
+    timeout
+        .is_finite()
+        .then(|| Duration::from_secs_f64(timeout.max(0.0)))
+}
+
+/// Awaits `fut`, bounding it by `timeout` if given.
+///
+/// If `fut` hasn't completed within `timeout`, returns an error built from
+/// `timeout_msg` instead of waiting indefinitely. With `timeout` set to
+/// `None`, `fut` is simply awaited to completion.
+async fn with_optional_timeout<T>(
+    timeout: Option<Duration>,
+    fut: impl Future<Output = anyhow::Result<T>>,
+    timeout_msg: &str,
+) -> anyhow::Result<T> {
+    match timeout {
+        Some(duration) => tokio::time::timeout(duration, fut)
+            .await
+            .map_err(|_| anyhow::anyhow!("{timeout_msg}"))?,
+        None => fut.await,
+    }
+}
+
+/// Connects to `uri`, applying `timeout` to the connection attempt, or
+/// [`DEFAULT_CONNECT_TIMEOUT`] if `timeout` is `None`.
+async fn connect_client(uri: &str, timeout: Option<Duration>) -> anyhow::Result<Client> {
+    with_optional_timeout(
+        timeout.or(Some(DEFAULT_CONNECT_TIMEOUT)),
+        async {
+            Client::connect(uri)
+                .await
+                .with_context(|| format!("could not connect to {uri}"))
+        },
+        &format!("timed out connecting to {uri}"),
+    )
+    .await
+}
+
 /// Parses CLI arguments and runs the requested Wyoming client operation.
 ///
 /// # Errors
@@ -319,17 +377,17 @@ pub async fn cli_main() -> anyhow::Result<()> {
         timeout,
     } = Args::parse();
 
-    let timeout = Duration::from_secs_f64(timeout.max(0.0));
+    let timeout = resolve_timeout(timeout);
     let uri = uri.unwrap_or_else(|| default_uri(std::env::var("XDG_RUNTIME_DIR").ok().as_deref()));
 
     if list_voices || list_languages {
-        let mut client = tokio::time::timeout(timeout, Client::connect(&uri))
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out connecting to {uri}"))?
-            .with_context(|| format!("could not connect to {uri}"))?;
-        let info = tokio::time::timeout(timeout, client.describe())
-            .await
-            .map_err(|_| anyhow::anyhow!("server did not respond in time"))??;
+        let mut client = connect_client(&uri, timeout).await?;
+        let info = with_optional_timeout(
+            timeout,
+            async { Ok(client.describe().await?) },
+            "server did not respond in time",
+        )
+        .await?;
         if list_voices {
             print_voices(&info);
         }
@@ -344,10 +402,7 @@ pub async fn cli_main() -> anyhow::Result<()> {
     // wait for it.
     let text = resolve_text(text.as_deref())?;
 
-    let mut client = tokio::time::timeout(timeout, Client::connect(&uri))
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out connecting to {uri}"))?
-        .with_context(|| format!("could not connect to {uri}"))?;
+    let mut client = connect_client(&uri, timeout).await?;
 
     let mut synth = SynthesizeData::new(text);
     if voice.is_some() || language.is_some() {
@@ -358,16 +413,14 @@ pub async fn cli_main() -> anyhow::Result<()> {
     }
 
     let to_file = output.as_deref().filter(|path| *path != "-");
-    let result = if let Some(path) = to_file {
-        tokio::time::timeout(
-            timeout,
-            synthesize_to_file(&mut client, synth, path, format),
-        )
-        .await
-    } else {
-        tokio::time::timeout(timeout, synthesize_to_stdout(&mut client, synth, format)).await
+    let synth_fut = async {
+        if let Some(path) = to_file {
+            synthesize_to_file(&mut client, synth, path, format).await
+        } else {
+            synthesize_to_stdout(&mut client, synth, format).await
+        }
     };
-    result.map_err(|_| anyhow::anyhow!("server did not respond in time"))??;
+    with_optional_timeout(timeout, synth_fut, "server did not respond in time").await?;
 
     Ok(())
 }
@@ -417,5 +470,31 @@ mod tests {
     #[test]
     fn default_uri_falls_back_to_tcp() {
         assert_eq!(default_uri(None), "tcp://127.0.0.1:10200");
+    }
+
+    #[test]
+    fn resolve_timeout_omitted_means_no_timeout() {
+        assert_eq!(resolve_timeout(None), None);
+    }
+
+    #[test]
+    fn resolve_timeout_converts_finite_seconds() {
+        assert_eq!(resolve_timeout(Some(5.0)), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn resolve_timeout_clamps_negative_to_zero() {
+        assert_eq!(resolve_timeout(Some(-1.0)), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn resolve_timeout_treats_infinity_as_no_timeout() {
+        assert_eq!(resolve_timeout(Some(f64::INFINITY)), None);
+        assert_eq!(resolve_timeout(Some(f64::NEG_INFINITY)), None);
+    }
+
+    #[test]
+    fn resolve_timeout_treats_nan_as_no_timeout() {
+        assert_eq!(resolve_timeout(Some(f64::NAN)), None);
     }
 }
