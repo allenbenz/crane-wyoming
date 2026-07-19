@@ -238,6 +238,13 @@ impl ModelRuntime {
     /// model before moving it to a dedicated thread. This ordering lets
     /// tests inject a mock [`Tts`] implementation without touching disk.
     ///
+    /// `device` is the device `tts` was constructed on; the dedicated
+    /// thread runs each request's generation inside
+    /// [`Device::with_context`](candle_core::Device::with_context) so CPU
+    /// inference uses candle's warm, affinity-pinned rayon pool instead of
+    /// rayon's ambient global pool. Pass `&Device::Cpu` for mock models in
+    /// tests -- it's a cheap no-op wrapper either way.
+    ///
     /// # Errors
     ///
     /// Returns an error if the model's dedicated thread fails to spawn.
@@ -246,6 +253,7 @@ impl ModelRuntime {
         name: String,
         model_type_name: &'static str,
         tts: Box<dyn Tts + Send>,
+        device: &Device,
     ) -> Result<()> {
         let audio_info = tts.audio_info();
         let voices = tts.voices();
@@ -257,9 +265,12 @@ impl ModelRuntime {
         let thread_name = format!("tts-{name}");
         let log_name = name.clone();
         let thread_pending_count = Arc::clone(&pending_count);
+        let thread_device = device.clone();
         std::thread::Builder::new()
             .name(thread_name)
-            .spawn(move || run_tts_thread(rx, tts, &log_name, &thread_pending_count))
+            .spawn(move || {
+                run_tts_thread(rx, tts, &log_name, &thread_pending_count, &thread_device);
+            })
             .map_err(|e| anyhow::anyhow!("Failed to spawn TTS thread: {e}"))?;
 
         if self.default_tts.is_none() {
@@ -301,7 +312,7 @@ impl ModelRuntime {
             "TTS model loaded, spawning thread",
         );
 
-        self.register_tts(name.clone(), resolved_type.display_name(), tts)?;
+        self.register_tts(name.clone(), resolved_type.display_name(), tts, device)?;
         // Cache keys should discriminate by the full on-disk path, not just
         // its final component -- two directories with the same file name
         // (different checkpoint, dtype, or quantization) must not collide.
@@ -464,18 +475,32 @@ fn extract_model_name(model_path: &str) -> String {
 /// Processes both blob ([`TtsGenerateRequest`]) and incremental
 /// ([`TtsStreamRequest`]) requests from a single FIFO queue, so streaming and
 /// non-streaming requests for the same model never run concurrently.
+///
+/// Each request is handled inside `device`'s
+/// [`with_context`](candle_core::Device::with_context) so that, on CPU, its
+/// forward pass's matmuls dispatch onto candle's warm, affinity-pinned rayon
+/// pool instead of rayon's ambient global pool. It's a no-op on CUDA/Metal.
+/// This is scoped per request rather than around the whole loop: `with_context`
+/// installs candle's process-wide CPU pool by running the wrapped closure on
+/// one of that pool's own worker threads, blocking the caller until it
+/// returns -- wrapping the whole (otherwise idle, blocked-on-`recv`) loop
+/// would permanently pin one pool worker per loaded CPU model for as long as
+/// the model is loaded, starving other models' forward passes and, once the
+/// number of loaded CPU models reaches the pool's worker count, deadlocking
+/// any further model whose job can never be scheduled onto a worker.
 fn run_tts_thread(
     mut rx: mpsc::UnboundedReceiver<TtsRequest>,
     mut tts: Box<dyn Tts + Send>,
     model_name: &str,
     pending_count: &AtomicU64,
+    device: &Device,
 ) {
     tracing::info!(model = %model_name, "TTS thread started");
     while let Some(req) = rx.blocking_recv() {
-        match req {
+        device.with_context(|| match req {
             TtsRequest::Generate(req) => handle_generate_request(&mut *tts, req, model_name),
             TtsRequest::Stream(req) => handle_stream_request(&mut *tts, &req, model_name),
-        }
+        });
         pending_count.fetch_sub(1, Ordering::Relaxed);
     }
     tracing::info!(model = %model_name, "TTS thread stopped (channel closed)");
@@ -599,6 +624,18 @@ mod tests {
     use candle_core::Device;
     use std::fs;
 
+    /// Registers `tts` on `Device::Cpu` -- the device is irrelevant to these
+    /// tests since `with_context` is a cheap no-op wrapper on CPU either way.
+    fn register_test_tts(
+        rt: &mut ModelRuntime,
+        name: &str,
+        model_type_name: &'static str,
+        tts: Box<dyn Tts + Send>,
+    ) {
+        rt.register_tts(name.into(), model_type_name, tts, &Device::Cpu)
+            .unwrap();
+    }
+
     struct MockTts {
         audio_info: AudioInfo,
         voices: Vec<VoiceInfo>,
@@ -678,8 +715,7 @@ mod tests {
     #[test]
     fn test_register_tts_stores_handle() {
         let mut rt = ModelRuntime::new();
-        rt.register_tts("m1".into(), "qwen3_tts", Box::new(MockTts::new()))
-            .unwrap();
+        register_test_tts(&mut rt, "m1", "qwen3_tts", Box::new(MockTts::new()));
 
         let handle = rt.tts_handle("m1").expect("handle should be registered");
         assert_eq!(handle.audio_info().sample_rate, 24000);
@@ -691,8 +727,7 @@ mod tests {
     #[test]
     fn test_generate_speech_roundtrip() {
         let mut rt = ModelRuntime::new();
-        rt.register_tts("m1".into(), "qwen3_tts", Box::new(MockTts::new()))
-            .unwrap();
+        register_test_tts(&mut rt, "m1", "qwen3_tts", Box::new(MockTts::new()));
         let handle = rt.tts_handle("m1").unwrap();
 
         let (tx, rx) = oneshot::channel();
@@ -716,12 +751,12 @@ mod tests {
     #[test]
     fn test_generate_voice_clone_roundtrip() {
         let mut rt = ModelRuntime::new();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new().with_cloning()),
-        )
-        .unwrap();
+        );
         let handle = rt.tts_handle("m1").unwrap();
 
         let (tx, rx) = oneshot::channel();
@@ -745,18 +780,18 @@ mod tests {
     #[test]
     fn test_multiple_tts_models() {
         let mut rt = ModelRuntime::new();
-        rt.register_tts(
-            "a".into(),
+        register_test_tts(
+            &mut rt,
+            "a",
             "qwen3_tts",
             Box::new(MockTts::new().with_sample_rate(24000)),
-        )
-        .unwrap();
-        rt.register_tts(
-            "b".into(),
+        );
+        register_test_tts(
+            &mut rt,
+            "b",
             "voxtral_tts",
             Box::new(MockTts::new().with_sample_rate(16000)),
-        )
-        .unwrap();
+        );
 
         assert_eq!(rt.tts_handle("a").unwrap().audio_info().sample_rate, 24000);
         assert_eq!(rt.tts_handle("b").unwrap().audio_info().sample_rate, 16000);
@@ -767,8 +802,7 @@ mod tests {
         let mut rt = ModelRuntime::new();
         assert!(rt.default_tts_handle().is_none());
 
-        rt.register_tts("a".into(), "qwen3_tts", Box::new(MockTts::new()))
-            .unwrap();
+        register_test_tts(&mut rt, "a", "qwen3_tts", Box::new(MockTts::new()));
         assert!(rt.default_tts_handle().is_some());
     }
 
@@ -800,8 +834,7 @@ mod tests {
     fn test_default_tts_name() {
         let mut rt = ModelRuntime::new();
         assert!(rt.default_tts_name().is_none());
-        rt.register_tts("m1".into(), "qwen3_tts", Box::new(MockTts::new()))
-            .unwrap();
+        register_test_tts(&mut rt, "m1", "qwen3_tts", Box::new(MockTts::new()));
         assert_eq!(rt.default_tts_name(), Some("m1"));
     }
 
@@ -853,18 +886,18 @@ mod tests {
     #[test]
     fn test_register_duplicate_name() {
         let mut rt = ModelRuntime::new();
-        rt.register_tts(
-            "dup".into(),
+        register_test_tts(
+            &mut rt,
+            "dup",
             "qwen3_tts",
             Box::new(MockTts::new().with_sample_rate(24000)),
-        )
-        .unwrap();
-        rt.register_tts(
-            "dup".into(),
+        );
+        register_test_tts(
+            &mut rt,
+            "dup",
             "voxtral_tts",
             Box::new(MockTts::new().with_sample_rate(16000)),
-        )
-        .unwrap();
+        );
 
         let handle = rt.tts_handle("dup").unwrap();
         assert_eq!(handle.audio_info().sample_rate, 16000);
@@ -911,12 +944,12 @@ mod tests {
     #[test]
     fn test_panic_in_generate_is_caught() {
         let mut rt = ModelRuntime::new();
-        rt.register_tts(
-            "panic_model".into(),
+        register_test_tts(
+            &mut rt,
+            "panic_model",
             "qwen3_tts",
             Box::new(PanickingTts::new()),
-        )
-        .unwrap();
+        );
         let handle = rt.tts_handle("panic_model").unwrap();
 
         let (tx1, rx1) = oneshot::channel();
@@ -1033,12 +1066,12 @@ mod tests {
     #[test]
     fn test_generate_speech_stream_multiple_chunks() {
         let mut rt = ModelRuntime::new();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(StreamingMockTts::new(vec![0.1, 0.2, 0.3])),
-        )
-        .unwrap();
+        );
 
         let mut rx = rt
             .generate_speech_stream(
@@ -1074,12 +1107,12 @@ mod tests {
     #[test]
     fn test_generate_speech_stream_empty() {
         let mut rt = ModelRuntime::new();
-        rt.register_tts(
-            "empty".into(),
+        register_test_tts(
+            &mut rt,
+            "empty",
             "qwen3_tts",
             Box::new(StreamingMockTts::new(vec![])),
-        )
-        .unwrap();
+        );
 
         let mut rx = rt
             .generate_speech_stream(
@@ -1096,12 +1129,12 @@ mod tests {
     #[test]
     fn test_generate_speech_stream_receiver_dropped() {
         let mut rt = ModelRuntime::new();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(StreamingMockTts::new(vec![0.1, 0.2, 0.3])),
-        )
-        .unwrap();
+        );
 
         let mut rx = rt
             .generate_speech_stream(
@@ -1215,12 +1248,12 @@ mod tests {
     #[test]
     fn test_generate_speech_stream_panic_recovery() {
         let mut rt = ModelRuntime::new();
-        rt.register_tts(
-            "panic_stream".into(),
+        register_test_tts(
+            &mut rt,
+            "panic_stream",
             "qwen3_tts",
             Box::new(StreamPanickingTts::new()),
-        )
-        .unwrap();
+        );
 
         let mut rx = rt
             .generate_speech_stream(
@@ -1264,8 +1297,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut rt = ModelRuntime::new();
         rt.set_tts_cache(TtsCache::new(dir.path().to_path_buf(), 10_000_000).unwrap());
-        rt.register_tts("m1".into(), "qwen3_tts", Box::new(MockTts::new()))
-            .unwrap();
+        register_test_tts(&mut rt, "m1", "qwen3_tts", Box::new(MockTts::new()));
 
         // First request: cache miss, generates and caches.
         let (tx1, rx1) = oneshot::channel();
@@ -1314,12 +1346,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut rt = ModelRuntime::new();
         rt.set_tts_cache(TtsCache::new(dir.path().to_path_buf(), 10_000_000).unwrap());
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new().with_cloning()),
-        )
-        .unwrap();
+        );
 
         let (tx, rx) = oneshot::channel();
         rt.generate_speech(

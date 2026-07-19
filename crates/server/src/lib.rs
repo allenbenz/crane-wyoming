@@ -724,6 +724,18 @@ mod tests {
         ModelRuntime::new()
     }
 
+    /// Registers `tts` on `Device::Cpu` -- the device is irrelevant to these
+    /// tests since `with_context` is a cheap no-op wrapper on CPU either way.
+    fn register_test_tts(
+        rt: &mut ModelRuntime,
+        name: &str,
+        model_type_name: &'static str,
+        tts: Box<dyn Tts + Send>,
+    ) {
+        rt.register_tts(name.into(), model_type_name, tts, &Device::Cpu)
+            .unwrap();
+    }
+
     async fn spawn_test_server(runtime: ModelRuntime, voice_map: VoiceMap) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -761,8 +773,9 @@ mod tests {
     #[tokio::test]
     async fn tcp_synthesize_round_trip() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(
                 24000,
@@ -771,8 +784,7 @@ mod tests {
                     languages: vec!["en".into()],
                 }],
             )),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
         let addr = spawn_test_server(rt, vm).await;
 
@@ -820,8 +832,9 @@ mod tests {
     #[tokio::test]
     async fn test_client_describe() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(
                 24000,
@@ -830,8 +843,7 @@ mod tests {
                     languages: vec!["en".into()],
                 }],
             )),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
         let addr = spawn_test_server(rt, vm).await;
 
@@ -845,8 +857,9 @@ mod tests {
     #[tokio::test]
     async fn test_client_synthesize() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(
                 24000,
@@ -855,8 +868,7 @@ mod tests {
                     languages: vec!["en".into()],
                 }],
             )),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
         let addr = spawn_test_server(rt, vm).await;
 
@@ -871,8 +883,9 @@ mod tests {
     #[tokio::test]
     async fn test_client_synthesize_streaming() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(
                 24000,
@@ -881,8 +894,7 @@ mod tests {
                     languages: vec!["en".into()],
                 }],
             )),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
         let addr = spawn_test_server(rt, vm).await;
 
@@ -905,8 +917,9 @@ mod tests {
     #[tokio::test]
     async fn test_client_synthesize_error() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(
                 24000,
@@ -915,8 +928,7 @@ mod tests {
                     languages: vec!["en".into()],
                 }],
             )),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
         let addr = spawn_test_server(rt, vm).await;
 
@@ -935,8 +947,9 @@ mod tests {
     #[tokio::test]
     async fn test_client_synthesize_streaming_break() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(
                 24000,
@@ -945,8 +958,7 @@ mod tests {
                     languages: vec!["en".into()],
                 }],
             )),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
         let addr = spawn_test_server(rt, vm).await;
 

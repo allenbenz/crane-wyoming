@@ -862,6 +862,18 @@ mod tests {
         ModelRuntime::new()
     }
 
+    /// Registers `tts` on `Device::Cpu` -- the device is irrelevant to these
+    /// tests since `with_context` is a cheap no-op wrapper on CPU either way.
+    fn register_test_tts(
+        rt: &mut ModelRuntime,
+        name: &str,
+        model_type_name: &'static str,
+        tts: Box<dyn Tts + Send>,
+    ) {
+        rt.register_tts(name.into(), model_type_name, tts, &Device::Cpu)
+            .unwrap();
+    }
+
     fn voices(names: &[&str]) -> Vec<VoiceInfo> {
         names
             .iter()
@@ -898,12 +910,12 @@ mod tests {
     #[tokio::test]
     async fn test_synthesize_default_voice() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(24000, voices(&["alice"]))),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
         let results = run_events(
@@ -934,18 +946,18 @@ mod tests {
     #[tokio::test]
     async fn test_synthesize_named_voice() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "a".into(),
+        register_test_tts(
+            &mut rt,
+            "a",
             "qwen3_tts",
             Box::new(MockTts::new(24000, voices(&["alice"]))),
-        )
-        .unwrap();
-        rt.register_tts(
-            "b".into(),
+        );
+        register_test_tts(
+            &mut rt,
+            "b",
             "voxtral_tts",
             Box::new(MockTts::new(16000, voices(&["bob"]))),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["a".to_string(), "b".to_string()], &rt);
 
         let results = run_events(
@@ -966,8 +978,9 @@ mod tests {
     #[tokio::test]
     async fn test_synthesize_language_fallback_voice() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "a".into(),
+        register_test_tts(
+            &mut rt,
+            "a",
             "qwen3_tts",
             Box::new(MockTts::new(
                 24000,
@@ -976,10 +989,10 @@ mod tests {
                     languages: vec!["en".into()],
                 }],
             )),
-        )
-        .unwrap();
-        rt.register_tts(
-            "b".into(),
+        );
+        register_test_tts(
+            &mut rt,
+            "b",
             "voxtral_tts",
             Box::new(MockTts::new(
                 16000,
@@ -988,8 +1001,7 @@ mod tests {
                     languages: vec!["de".into()],
                 }],
             )),
-        )
-        .unwrap();
+        );
         // "a" is the default model (registered first), but a request for
         // German with no explicit voice must resolve to "b"'s German voice
         // instead of silently falling back to the (English) default.
@@ -1015,8 +1027,9 @@ mod tests {
     #[tokio::test]
     async fn test_synthesize_named_voice_overrides_language() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "a".into(),
+        register_test_tts(
+            &mut rt,
+            "a",
             "qwen3_tts",
             Box::new(MockTts::new(
                 24000,
@@ -1025,10 +1038,10 @@ mod tests {
                     languages: vec!["en".into()],
                 }],
             )),
-        )
-        .unwrap();
-        rt.register_tts(
-            "b".into(),
+        );
+        register_test_tts(
+            &mut rt,
+            "b",
             "voxtral_tts",
             Box::new(MockTts::new(
                 16000,
@@ -1037,8 +1050,7 @@ mod tests {
                     languages: vec!["de".into()],
                 }],
             )),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["a".to_string(), "b".to_string()], &rt);
 
         // Explicit voice name ("casual", model "a") conflicts with the
@@ -1063,8 +1075,9 @@ mod tests {
     #[tokio::test]
     async fn test_synthesize_unmatched_language_falls_back_to_default() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "a".into(),
+        register_test_tts(
+            &mut rt,
+            "a",
             "qwen3_tts",
             Box::new(MockTts::new(
                 24000,
@@ -1073,10 +1086,10 @@ mod tests {
                     languages: vec!["en".into()],
                 }],
             )),
-        )
-        .unwrap();
-        rt.register_tts(
-            "b".into(),
+        );
+        register_test_tts(
+            &mut rt,
+            "b",
             "voxtral_tts",
             Box::new(MockTts::new(
                 16000,
@@ -1085,8 +1098,7 @@ mod tests {
                     languages: vec!["de".into()],
                 }],
             )),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["a".to_string(), "b".to_string()], &rt);
 
         // "fr" matches no registered voice, so this must fall back to the
@@ -1111,12 +1123,12 @@ mod tests {
     #[tokio::test]
     async fn test_synthesize_unknown_voice() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(24000, voices(&["alice"]))),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
         let results = run_events(
@@ -1152,8 +1164,7 @@ mod tests {
     #[tokio::test]
     async fn test_synthesize_generation_failure() {
         let mut rt = test_runtime();
-        rt.register_tts("m1".into(), "qwen3_tts", Box::new(FailingTts))
-            .unwrap();
+        register_test_tts(&mut rt, "m1", "qwen3_tts", Box::new(FailingTts));
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
         let results =
@@ -1169,12 +1180,12 @@ mod tests {
     #[tokio::test]
     async fn test_synthesize_streams_multiple_chunks() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(StreamingMockTts::new(24000, vec![0.1, 0.2, 0.3])),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
         let results = run_events(
@@ -1204,12 +1215,12 @@ mod tests {
     #[tokio::test]
     async fn test_synthesize_streaming_empty_stream() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(StreamingMockTts::new(24000, vec![])),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
         let results = run_events(
@@ -1232,12 +1243,12 @@ mod tests {
     async fn test_synthesize_blob_fallback_when_streaming_disabled() {
         let mut rt = test_runtime();
         rt.set_streaming_enabled(false);
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(StreamingMockTts::new(24000, vec![0.1, 0.2, 0.3])),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
         let results = run_events(
@@ -1265,8 +1276,9 @@ mod tests {
     #[tokio::test]
     async fn test_synthesize_mid_stream_failure_sends_stop_then_error() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MidStreamFailingTts {
                 audio_info: AudioInfo {
@@ -1275,8 +1287,7 @@ mod tests {
                     bits_per_sample: 16,
                 },
             }),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
         let results =
@@ -1329,12 +1340,12 @@ mod tests {
     #[tokio::test]
     async fn test_describe_single_model() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(24000, voices(&["alice"]))),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
         let results = run_events(&rt, &vm, vec![Event::Describe]).await;
@@ -1360,18 +1371,18 @@ mod tests {
     #[tokio::test]
     async fn test_describe_multiple_models() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "a".into(),
+        register_test_tts(
+            &mut rt,
+            "a",
             "qwen3_tts",
             Box::new(MockTts::new(24000, voices(&["alice"]))),
-        )
-        .unwrap();
-        rt.register_tts(
-            "b".into(),
+        );
+        register_test_tts(
+            &mut rt,
+            "b",
             "voxtral_tts",
             Box::new(MockTts::new(16000, voices(&["bob"]))),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["a".to_string(), "b".to_string()], &rt);
 
         let results = run_events(&rt, &vm, vec![Event::Describe]).await;
@@ -1393,18 +1404,18 @@ mod tests {
     #[tokio::test]
     async fn test_describe_voice_conflict_excludes_duplicate() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "first".into(),
+        register_test_tts(
+            &mut rt,
+            "first",
             "qwen3_tts",
             Box::new(MockTts::new(24000, voices(&["alice"]))),
-        )
-        .unwrap();
-        rt.register_tts(
-            "second".into(),
+        );
+        register_test_tts(
+            &mut rt,
+            "second",
             "voxtral_tts",
             Box::new(MockTts::new(16000, voices(&["alice"]))),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["first".to_string(), "second".to_string()], &rt);
 
         let results = run_events(&rt, &vm, vec![Event::Describe]).await;
@@ -1429,18 +1440,18 @@ mod tests {
     #[tokio::test]
     async fn test_describe_excludes_model_not_in_voice_map() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "configured".into(),
+        register_test_tts(
+            &mut rt,
+            "configured",
             "qwen3_tts",
             Box::new(MockTts::new(24000, voices(&["alice"]))),
-        )
-        .unwrap();
-        rt.register_tts(
-            "unconfigured".into(),
+        );
+        register_test_tts(
+            &mut rt,
+            "unconfigured",
             "voxtral_tts",
             Box::new(MockTts::new(16000, voices(&["bob"]))),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["configured".to_string()], &rt);
 
         let results = run_events(&rt, &vm, vec![Event::Describe]).await;
@@ -1457,12 +1468,12 @@ mod tests {
     #[tokio::test]
     async fn test_describe_streaming_is_true() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(24000, voices(&["alice"]))),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
         let results = run_events(&rt, &vm, vec![Event::Describe]).await;
@@ -1479,12 +1490,12 @@ mod tests {
     async fn test_describe_streaming_disabled() {
         let mut rt = test_runtime();
         rt.set_streaming_enabled(false);
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(24000, voices(&["alice"]))),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
         let results = run_events(&rt, &vm, vec![Event::Describe]).await;
@@ -1534,12 +1545,12 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_events_sequential() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(24000, voices(&["alice"]))),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
         let results = run_events(
@@ -1564,18 +1575,18 @@ mod tests {
     #[test]
     fn test_voice_map_first_wins() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "first".into(),
+        register_test_tts(
+            &mut rt,
+            "first",
             "qwen3_tts",
             Box::new(MockTts::new(24000, voices(&["alice"]))),
-        )
-        .unwrap();
-        rt.register_tts(
-            "second".into(),
+        );
+        register_test_tts(
+            &mut rt,
+            "second",
             "voxtral_tts",
             Box::new(MockTts::new(16000, voices(&["alice"]))),
-        )
-        .unwrap();
+        );
 
         let vm = VoiceMap::new(&["first".to_string(), "second".to_string()], &rt);
         assert_eq!(vm.model_for_voice("alice"), Some("first"));
@@ -1584,18 +1595,18 @@ mod tests {
     #[test]
     fn test_voice_map_separate_voices() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "a".into(),
+        register_test_tts(
+            &mut rt,
+            "a",
             "qwen3_tts",
             Box::new(MockTts::new(24000, voices(&["alice"]))),
-        )
-        .unwrap();
-        rt.register_tts(
-            "b".into(),
+        );
+        register_test_tts(
+            &mut rt,
+            "b",
             "voxtral_tts",
             Box::new(MockTts::new(16000, voices(&["bob"]))),
-        )
-        .unwrap();
+        );
 
         let vm = VoiceMap::new(&["a".to_string(), "b".to_string()], &rt);
         assert_eq!(vm.model_for_voice("alice"), Some("a"));
@@ -1606,12 +1617,12 @@ mod tests {
     #[test]
     fn test_voice_map_default_model() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(24000, voices(&["alice"]))),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
         assert_eq!(vm.default_model(), Some("m1"));
     }
@@ -1627,8 +1638,9 @@ mod tests {
     #[test]
     fn test_voice_map_language_lookup() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(
                 24000,
@@ -1643,8 +1655,7 @@ mod tests {
                     },
                 ],
             )),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
         assert_eq!(vm.model_for_language("de"), Some(("m1", "de_female")));
@@ -1658,8 +1669,9 @@ mod tests {
     #[test]
     fn test_voice_map_language_first_model_wins() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "first".into(),
+        register_test_tts(
+            &mut rt,
+            "first",
             "qwen3_tts",
             Box::new(MockTts::new(
                 24000,
@@ -1668,10 +1680,10 @@ mod tests {
                     languages: vec!["de".into()],
                 }],
             )),
-        )
-        .unwrap();
-        rt.register_tts(
-            "second".into(),
+        );
+        register_test_tts(
+            &mut rt,
+            "second",
             "voxtral_tts",
             Box::new(MockTts::new(
                 16000,
@@ -1680,8 +1692,7 @@ mod tests {
                     languages: vec!["de".into()],
                 }],
             )),
-        )
-        .unwrap();
+        );
 
         let vm = VoiceMap::new(&["first".to_string(), "second".to_string()], &rt);
         assert_eq!(vm.model_for_language("de"), Some(("first", "alice")));
@@ -1690,12 +1701,12 @@ mod tests {
     #[tokio::test]
     async fn test_audio_start_width_is_bytes() {
         let mut rt = test_runtime();
-        rt.register_tts(
-            "m1".into(),
+        register_test_tts(
+            &mut rt,
+            "m1",
             "qwen3_tts",
             Box::new(MockTts::new(24000, voices(&["alice"]))),
-        )
-        .unwrap();
+        );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
         let results =
