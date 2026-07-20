@@ -5,12 +5,14 @@
 // (https://github.com/lucasjinreal/Crane), Copyright (c) 2024 Nicholas Jela,
 // licensed under the MIT License.
 
-//! Protocol-independent TTS model runtime.
+//! Protocol-independent TTS/ASR model runtime.
 //!
-//! [`ModelRuntime`] owns every loaded TTS model, keyed by registration name.
-//! Consumers load models via [`ModelRuntime::load_tts`], then send
-//! generation requests through [`ModelRuntime::generate_speech`] /
-//! [`ModelRuntime::generate_speech_stream`]. Each TTS model runs on its own
+//! [`ModelRuntime`] owns every loaded TTS and ASR model, keyed by
+//! registration name. Consumers load TTS models via
+//! [`ModelRuntime::load_tts`], then send generation requests through
+//! [`ModelRuntime::generate_speech`] / [`ModelRuntime::generate_speech_stream`];
+//! ASR models are loaded via [`ModelRuntime::load_asr`] and dispatched
+//! through [`ModelRuntime::transcribe`]. Each model runs on its own
 //! dedicated OS thread and is addressed through channels, so [`ModelRuntime`]
 //! can be shared via `Arc` across async tasks without locking.
 
@@ -25,6 +27,7 @@ use candle_core::{DType, Device, Tensor};
 use tokio::sync::{mpsc, oneshot};
 
 use crane::audio::tts::{AudioInfo, Tts, VoiceInfo};
+use crane::audio::{Asr, TranscribeOptions, Transcript};
 use crane_core::generation::SpeechOptions;
 
 use crate::engine::cache::{CacheKey, TtsCache};
@@ -172,10 +175,71 @@ impl TtsHandle {
     }
 }
 
-/// Protocol-independent TTS model runtime.
+/// A request to transcribe audio, sent to an ASR model's dedicated thread.
 ///
-/// Owns every loaded TTS model, keyed by name. crane-wyoming builds one
-/// `ModelRuntime` at startup and shares it via `Arc`.
+/// Transport-agnostic like [`TtsGenerateRequest`]: it carries no Wyoming- or
+/// HTTP-specific fields. `audio` must already be mono f32 PCM at the
+/// model's [`AsrHandle::input_sample_rate`]; converting from wire PCM bytes
+/// is the caller's responsibility.
+pub struct AsrTranscribeRequest {
+    /// Mono f32 PCM audio at the model's expected sample rate.
+    pub audio: Vec<f32>,
+    /// Language hint (e.g. "en", "zh"), or `None` to let the model
+    /// auto-detect.
+    pub language: Option<String>,
+    /// Channel to send back the transcription result.
+    pub response_tx: oneshot::Sender<Result<Transcript>>,
+}
+
+/// Handle to an ASR model running on its dedicated thread.
+///
+/// The input sample rate is queried once at load time, before the model is
+/// moved to its thread, so it can be read without blocking on the
+/// transcription queue.
+pub struct AsrHandle {
+    tx: mpsc::UnboundedSender<AsrTranscribeRequest>,
+    input_sample_rate: u32,
+    model_type_name: &'static str,
+    pending_count: Arc<AtomicU64>,
+}
+
+impl AsrHandle {
+    /// Returns the sample rate this model expects input audio at (e.g. 16000).
+    #[must_use]
+    pub fn input_sample_rate(&self) -> u32 {
+        self.input_sample_rate
+    }
+
+    /// Returns the model type name (e.g. "`qwen3_asr`").
+    #[must_use]
+    pub fn model_type_name(&self) -> &'static str {
+        self.model_type_name
+    }
+
+    /// Returns the number of requests currently queued or being processed.
+    #[must_use]
+    pub fn pending_count(&self) -> u64 {
+        self.pending_count.load(Ordering::Relaxed)
+    }
+
+    /// Send a transcription request to the model's thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model's thread has stopped.
+    pub fn send(&self, req: AsrTranscribeRequest) -> Result<()> {
+        self.pending_count.fetch_add(1, Ordering::Relaxed);
+        self.tx.send(req).map_err(|_| {
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            anyhow::anyhow!("ASR thread has stopped")
+        })
+    }
+}
+
+/// Protocol-independent TTS/ASR model runtime.
+///
+/// Owns every loaded TTS and ASR model, keyed by name. crane-wyoming builds
+/// one `ModelRuntime` at startup and shares it via `Arc`.
 pub struct ModelRuntime {
     tts: HashMap<String, TtsHandle>,
     default_tts: Option<String>,
@@ -185,6 +249,8 @@ pub struct ModelRuntime {
     /// incremental TTS delivery. Defaults to `true`; see
     /// [`set_streaming_enabled`](Self::set_streaming_enabled).
     streaming_enabled: bool,
+    asr: HashMap<String, AsrHandle>,
+    default_asr: Option<String>,
 }
 
 impl Default for ModelRuntime {
@@ -202,6 +268,8 @@ impl ModelRuntime {
             default_tts: None,
             tts_cache: None,
             streaming_enabled: true,
+            asr: HashMap::new(),
+            default_asr: None,
         }
     }
 
@@ -461,6 +529,131 @@ impl ModelRuntime {
         })?;
         Ok(chunk_rx)
     }
+
+    /// Register an already-constructed ASR model under `name`.
+    ///
+    /// Queries the input sample rate from the model before moving it to a
+    /// dedicated thread. This ordering lets tests inject a mock [`Asr`]
+    /// implementation without touching disk.
+    ///
+    /// See [`register_tts`](Self::register_tts) for why the dedicated
+    /// thread runs each request inside
+    /// [`Device::with_context`](candle_core::Device::with_context).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model's dedicated thread fails to spawn.
+    pub fn register_asr(
+        &mut self,
+        name: String,
+        model_type_name: &'static str,
+        asr: Box<dyn Asr + Send>,
+        device: &Device,
+    ) -> Result<()> {
+        let input_sample_rate = asr.input_sample_rate();
+        let pending_count = Arc::new(AtomicU64::new(0));
+
+        let (tx, rx) = mpsc::unbounded_channel::<AsrTranscribeRequest>();
+
+        let thread_name = format!("asr-{name}");
+        let log_name = name.clone();
+        let thread_pending_count = Arc::clone(&pending_count);
+        let thread_device = device.clone();
+        std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                run_asr_thread(rx, asr, &log_name, &thread_pending_count, &thread_device);
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to spawn ASR thread: {e}"))?;
+
+        if self.default_asr.is_none() {
+            self.default_asr = Some(name.clone());
+        }
+
+        self.asr.insert(
+            name,
+            AsrHandle {
+                tx,
+                input_sample_rate,
+                model_type_name,
+                pending_count,
+            },
+        );
+        Ok(())
+    }
+
+    /// Load an ASR model from disk and register it.
+    ///
+    /// Detects the model type from `model_path`, constructs the model, and
+    /// registers it under a name derived from the path's final component.
+    /// Returns the registration name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model fails to load.
+    pub fn load_asr(&mut self, model_path: &str, device: &Device, dtype: &DType) -> Result<String> {
+        let resolved_type = model_factory::resolve_asr(ModelType::Auto, model_path)?;
+        let asr = model_factory::create_asr(resolved_type, model_path, device, dtype)?;
+        let name = extract_asr_model_name(model_path);
+
+        tracing::info!(
+            name = %name,
+            model_type = %resolved_type.display_name(),
+            "ASR model loaded, spawning thread",
+        );
+
+        self.register_asr(name.clone(), resolved_type.display_name(), asr, device)?;
+        Ok(name)
+    }
+
+    /// Returns the ASR handle registered under `name`, if any.
+    #[must_use]
+    pub fn asr_handle(&self, name: &str) -> Option<&AsrHandle> {
+        self.asr.get(name)
+    }
+
+    /// Returns an arbitrary loaded ASR handle.
+    ///
+    /// Useful when only one ASR model is loaded (the common case for a
+    /// Wyoming server started with a single `--asr-model-path` flag).
+    #[must_use]
+    pub fn default_asr_handle(&self) -> Option<&AsrHandle> {
+        self.default_asr
+            .as_ref()
+            .and_then(|name| self.asr.get(name))
+    }
+
+    /// Returns the registration name of the default ASR model, if any.
+    #[must_use]
+    pub fn default_asr_name(&self) -> Option<&str> {
+        self.default_asr.as_deref()
+    }
+
+    /// Returns an iterator over all registered ASR model names and their handles.
+    ///
+    /// Iteration order is unspecified.
+    pub fn asr_handles(&self) -> impl Iterator<Item = (&str, &AsrHandle)> {
+        self.asr
+            .iter()
+            .map(|(name, handle)| (name.as_str(), handle))
+    }
+
+    /// Dispatch a transcription request to the named ASR model.
+    ///
+    /// Unlike [`generate_speech`](Self::generate_speech), there is no cache
+    /// equivalent -- ASR input is always unique audio, so caching would
+    /// never hit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `model_name` is not registered or the model's
+    /// thread has stopped.
+    pub fn transcribe(&self, model_name: &str, req: AsrTranscribeRequest) -> Result<()> {
+        let handle = self
+            .asr_handle(model_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown ASR model: {model_name}"))?;
+        handle.send(req)
+    }
 }
 
 /// Derive a registration name from a model path's final path component.
@@ -468,6 +661,13 @@ fn extract_model_name(model_path: &str) -> String {
     Path::new(model_path)
         .file_name()
         .map_or_else(|| "tts".to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// Derive a registration name from an ASR model path's final path component.
+fn extract_asr_model_name(model_path: &str) -> String {
+    Path::new(model_path)
+        .file_name()
+        .map_or_else(|| "asr".to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 /// Run the blocking generation loop for one TTS model on its dedicated thread.
@@ -616,6 +816,73 @@ fn handle_stream_request(tts: &mut dyn Tts, req: &TtsStreamRequest, model_name: 
             let _ = req.chunk_tx.blocking_send(Err(e));
         },
     }
+}
+
+/// Run the blocking transcription loop for one ASR model on its dedicated
+/// thread.
+///
+/// See [`run_tts_thread`] for why each request runs inside `device`'s
+/// [`with_context`](candle_core::Device::with_context).
+fn run_asr_thread(
+    mut rx: mpsc::UnboundedReceiver<AsrTranscribeRequest>,
+    mut asr: Box<dyn Asr + Send>,
+    model_name: &str,
+    pending_count: &AtomicU64,
+    device: &Device,
+) {
+    tracing::info!(model = %model_name, "ASR thread started");
+    while let Some(req) = rx.blocking_recv() {
+        device.with_context(|| handle_transcribe_request(&mut *asr, req, model_name));
+        pending_count.fetch_sub(1, Ordering::Relaxed);
+    }
+    tracing::info!(model = %model_name, "ASR thread stopped (channel closed)");
+}
+
+/// Handle one transcription request: transcribe the complete audio and send
+/// the result back via `req.response_tx`.
+fn handle_transcribe_request(asr: &mut dyn Asr, req: AsrTranscribeRequest, model_name: &str) {
+    let sample_count = req.audio.len();
+
+    if req.response_tx.is_closed() {
+        tracing::warn!(model = %model_name, sample_count, "Caller disconnected, skipping");
+        return;
+    }
+
+    let t0 = std::time::Instant::now();
+    let opts = TranscribeOptions {
+        language: req.language,
+        ..TranscribeOptions::default()
+    };
+
+    let panic_result =
+        std::panic::catch_unwind(AssertUnwindSafe(|| asr.transcribe(&req.audio, &opts)));
+
+    let result = match panic_result {
+        Ok(result) => result,
+        Err(panic_payload) => {
+            let msg = panic_message(&*panic_payload);
+            tracing::error!(model = %model_name, sample_count, panic = %msg, "ASR transcription panicked");
+            Err(anyhow::anyhow!("ASR transcription panicked: {msg}"))
+        },
+    };
+
+    let elapsed_ms = t0.elapsed().as_millis();
+    match &result {
+        Ok(transcript) => {
+            tracing::info!(
+                model = %model_name,
+                sample_count,
+                text_len = transcript.text.chars().count(),
+                elapsed_ms,
+                "ASR transcription complete",
+            );
+        },
+        Err(e) => {
+            tracing::error!(model = %model_name, sample_count, elapsed_ms, error = %e, "ASR transcription failed");
+        },
+    }
+
+    let _ = req.response_tx.send(result);
 }
 
 #[cfg(test)]
@@ -1377,5 +1644,288 @@ mod tests {
             .filter_map(std::result::Result::ok)
             .any(|e| e.path().is_dir());
         assert!(!has_entries);
+    }
+
+    /// Registers `asr` on `Device::Cpu` -- the device is irrelevant to
+    /// these tests since `with_context` is a cheap no-op wrapper on CPU
+    /// either way.
+    fn register_test_asr(
+        rt: &mut ModelRuntime,
+        name: &str,
+        model_type_name: &'static str,
+        asr: Box<dyn Asr + Send>,
+    ) {
+        rt.register_asr(name.into(), model_type_name, asr, &Device::Cpu)
+            .unwrap();
+    }
+
+    struct MockAsr {
+        input_sample_rate: u32,
+    }
+
+    impl MockAsr {
+        fn new() -> Self {
+            Self {
+                input_sample_rate: 16000,
+            }
+        }
+
+        fn with_sample_rate(mut self, sample_rate: u32) -> Self {
+            self.input_sample_rate = sample_rate;
+            self
+        }
+    }
+
+    impl Asr for MockAsr {
+        fn input_sample_rate(&self) -> u32 {
+            self.input_sample_rate
+        }
+
+        fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOptions) -> Result<Transcript> {
+            Ok(Transcript {
+                text: format!("heard {} samples", audio.len()),
+                language: opts.language.clone(),
+                is_final: true,
+            })
+        }
+    }
+
+    #[test]
+    fn test_register_asr_stores_handle() {
+        let mut rt = ModelRuntime::new();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr::new()));
+
+        let handle = rt.asr_handle("m1").expect("handle should be registered");
+        assert_eq!(handle.input_sample_rate(), 16000);
+        assert_eq!(handle.model_type_name(), "qwen3_asr");
+        assert_eq!(handle.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_transcribe_roundtrip() {
+        let mut rt = ModelRuntime::new();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr::new()));
+        let handle = rt.asr_handle("m1").unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        handle
+            .send(AsrTranscribeRequest {
+                audio: vec![0.0f32; 4],
+                language: None,
+                response_tx: tx,
+            })
+            .unwrap();
+
+        let transcript = rx.blocking_recv().unwrap().unwrap();
+        assert_eq!(transcript.text, "heard 4 samples");
+        assert!(transcript.is_final);
+        assert_eq!(transcript.language, None);
+    }
+
+    #[test]
+    fn test_transcribe_with_language_hint() {
+        let mut rt = ModelRuntime::new();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr::new()));
+
+        let (tx, rx) = oneshot::channel();
+        rt.transcribe(
+            "m1",
+            AsrTranscribeRequest {
+                audio: vec![0.0f32; 2],
+                language: Some("de".into()),
+                response_tx: tx,
+            },
+        )
+        .unwrap();
+
+        let transcript = rx.blocking_recv().unwrap().unwrap();
+        assert_eq!(transcript.language, Some("de".into()));
+    }
+
+    #[test]
+    fn test_multiple_asr_models() {
+        let mut rt = ModelRuntime::new();
+        register_test_asr(
+            &mut rt,
+            "a",
+            "qwen3_asr",
+            Box::new(MockAsr::new().with_sample_rate(16000)),
+        );
+        register_test_asr(
+            &mut rt,
+            "b",
+            "qwen3_asr",
+            Box::new(MockAsr::new().with_sample_rate(8000)),
+        );
+
+        assert_eq!(rt.asr_handle("a").unwrap().input_sample_rate(), 16000);
+        assert_eq!(rt.asr_handle("b").unwrap().input_sample_rate(), 8000);
+    }
+
+    #[test]
+    fn test_default_asr_handle() {
+        let mut rt = ModelRuntime::new();
+        assert!(rt.default_asr_handle().is_none());
+
+        register_test_asr(&mut rt, "a", "qwen3_asr", Box::new(MockAsr::new()));
+        assert!(rt.default_asr_handle().is_some());
+    }
+
+    #[test]
+    fn test_default_asr_name() {
+        let mut rt = ModelRuntime::new();
+        assert!(rt.default_asr_name().is_none());
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr::new()));
+        assert_eq!(rt.default_asr_name(), Some("m1"));
+    }
+
+    #[test]
+    fn test_asr_handle_not_found() {
+        let rt = ModelRuntime::new();
+        assert!(rt.asr_handle("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_asr_handles_iterator() {
+        let mut rt = ModelRuntime::new();
+        register_test_asr(&mut rt, "a", "qwen3_asr", Box::new(MockAsr::new()));
+        register_test_asr(&mut rt, "b", "qwen3_asr", Box::new(MockAsr::new()));
+
+        let mut names: Vec<&str> = rt.asr_handles().map(|(name, _)| name).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_extract_asr_model_name() {
+        assert_eq!(
+            extract_asr_model_name("/models/Qwen3-ASR-0.6B-hf"),
+            "Qwen3-ASR-0.6B-hf"
+        );
+        assert_eq!(extract_asr_model_name("/models/qwen-asr/"), "qwen-asr");
+        assert_eq!(extract_asr_model_name(""), "asr");
+    }
+
+    #[test]
+    fn test_send_after_asr_thread_stopped() {
+        let (tx, rx) = mpsc::unbounded_channel::<AsrTranscribeRequest>();
+        drop(rx);
+
+        let handle = AsrHandle {
+            tx,
+            input_sample_rate: 16000,
+            model_type_name: "qwen3_asr",
+            pending_count: Arc::new(AtomicU64::new(0)),
+        };
+
+        let (resp_tx, _resp_rx) = oneshot::channel();
+        let result = handle.send(AsrTranscribeRequest {
+            audio: vec![0.0f32; 4],
+            language: None,
+            response_tx: resp_tx,
+        });
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("stopped"));
+        assert_eq!(handle.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_register_asr_duplicate_name() {
+        let mut rt = ModelRuntime::new();
+        register_test_asr(
+            &mut rt,
+            "dup",
+            "qwen3_asr",
+            Box::new(MockAsr::new().with_sample_rate(16000)),
+        );
+        register_test_asr(
+            &mut rt,
+            "dup",
+            "qwen3_asr",
+            Box::new(MockAsr::new().with_sample_rate(8000)),
+        );
+
+        let handle = rt.asr_handle("dup").unwrap();
+        assert_eq!(handle.input_sample_rate(), 8000);
+    }
+
+    #[test]
+    fn test_transcribe_unknown_model() {
+        let rt = ModelRuntime::new();
+        let (tx, _rx) = oneshot::channel();
+        let result = rt.transcribe(
+            "nonexistent",
+            AsrTranscribeRequest {
+                audio: vec![0.0f32; 2],
+                language: None,
+                response_tx: tx,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    struct PanickingAsr {
+        call_count: u32,
+    }
+
+    impl PanickingAsr {
+        fn new() -> Self {
+            Self { call_count: 0 }
+        }
+    }
+
+    impl Asr for PanickingAsr {
+        fn input_sample_rate(&self) -> u32 {
+            16000
+        }
+
+        fn transcribe(&mut self, audio: &[f32], _opts: &TranscribeOptions) -> Result<Transcript> {
+            self.call_count += 1;
+            assert!(self.call_count != 1, "simulated model panic");
+            Ok(Transcript {
+                text: format!("ok {} samples", audio.len()),
+                language: None,
+                is_final: true,
+            })
+        }
+    }
+
+    #[test]
+    fn test_panic_in_transcribe_is_caught() {
+        let mut rt = ModelRuntime::new();
+        register_test_asr(
+            &mut rt,
+            "panic_model",
+            "qwen3_asr",
+            Box::new(PanickingAsr::new()),
+        );
+        let handle = rt.asr_handle("panic_model").unwrap();
+
+        let (tx1, rx1) = oneshot::channel();
+        handle
+            .send(AsrTranscribeRequest {
+                audio: vec![0.0f32; 4],
+                language: None,
+                response_tx: tx1,
+            })
+            .unwrap();
+
+        let result1 = rx1.blocking_recv().unwrap();
+        assert!(result1.is_err());
+        assert!(result1.unwrap_err().to_string().contains("panicked"));
+
+        let (tx2, rx2) = oneshot::channel();
+        handle
+            .send(AsrTranscribeRequest {
+                audio: vec![0.0f32; 2],
+                language: None,
+                response_tx: tx2,
+            })
+            .unwrap();
+
+        let result2 = rx2.blocking_recv().unwrap();
+        assert!(result2.is_ok());
+        assert_eq!(result2.unwrap().text, "ok 2 samples");
     }
 }
