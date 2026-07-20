@@ -5,11 +5,12 @@
 // (https://github.com/lucasjinreal/Crane), Copyright (c) 2024 Nicholas Jela,
 // licensed under the MIT License.
 
-//! TTS model factory for automatic model type detection and construction.
+//! TTS and ASR model factory for automatic model type detection and
+//! construction.
 //!
 //! Supports auto-detection from `config.json`'s `model_type` / `architectures`
-//! fields (Qwen3-TTS) or `params.json`'s `model_type` field (Voxtral-TTS), or
-//! explicit model type specification via CLI.
+//! fields (Qwen3-TTS, Qwen3-ASR) or `params.json`'s `model_type` field
+//! (Voxtral-TTS), or explicit model type specification via CLI.
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device};
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 //  Enums
 // ─────────────────────────────────────────────────────────────
 
-/// Supported TTS model architectures.
+/// Supported TTS/ASR model architectures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelType {
     /// Detect the model type from the model directory's config files.
@@ -29,6 +30,8 @@ pub enum ModelType {
     Qwen3TTS,
     /// Voxtral-4B-TTS.
     VoxtralTTS,
+    /// Qwen3-ASR.
+    Qwen3ASR,
 }
 
 impl ModelType {
@@ -40,6 +43,7 @@ impl ModelType {
         match s.to_lowercase().as_str() {
             "qwen3_tts" | "qwen3tts" | "qwen3-tts" | "tts" => Self::Qwen3TTS,
             "voxtral_tts" | "voxtral-tts" | "voxtral" | "voxtral_4b" => Self::VoxtralTTS,
+            "qwen3_asr" | "qwen3asr" | "qwen3-asr" | "asr" => Self::Qwen3ASR,
             _ => Self::Auto,
         }
     }
@@ -51,6 +55,31 @@ impl ModelType {
             Self::Auto => "auto",
             Self::Qwen3TTS => "qwen3_tts",
             Self::VoxtralTTS => "voxtral_tts",
+            Self::Qwen3ASR => "qwen3_asr",
+        }
+    }
+
+    /// Returns `true` if this is a TTS model type.
+    ///
+    /// `Auto` is neither a TTS nor an ASR type (it must be resolved to a
+    /// concrete type first), so this returns `false` for it.
+    #[must_use]
+    pub fn is_tts(&self) -> bool {
+        match self {
+            Self::Qwen3TTS | Self::VoxtralTTS => true,
+            Self::Qwen3ASR | Self::Auto => false,
+        }
+    }
+
+    /// Returns `true` if this is an ASR model type.
+    ///
+    /// `Auto` is neither a TTS nor an ASR type (it must be resolved to a
+    /// concrete type first), so this returns `false` for it.
+    #[must_use]
+    pub fn is_asr(&self) -> bool {
+        match self {
+            Self::Qwen3ASR => true,
+            Self::Qwen3TTS | Self::VoxtralTTS | Self::Auto => false,
         }
     }
 }
@@ -72,31 +101,35 @@ struct MistralConfig {
     model_type: Option<String>,
 }
 
-/// Probe whether `dir` contains a recognized TTS model, returning its
-/// type if so.
+/// Probe whether `dir` contains a recognized TTS or ASR model, returning
+/// its type if so.
 ///
 /// Only looks at `config.json`/`params.json`; unlike [`detect_model_type`],
 /// it never falls back to a path-name heuristic, so it returns `None` for
 /// directories that don't contain a recognizable model. This makes it
-/// suitable for scanning a parent directory (see [`discover_models`]),
-/// where non-model subdirectories must be silently skipped rather than
-/// misidentified.
+/// suitable for scanning a parent directory (see [`discover_models`] and
+/// [`discover_asr_models`]), where non-model subdirectories must be
+/// silently skipped rather than misidentified.
 #[must_use]
 pub fn probe_model_type(dir: &Path) -> Option<ModelType> {
     let config_path = dir.join("config.json");
     if let Ok(data) = std::fs::read(&config_path)
         && let Ok(config) = serde_json::from_slice::<HfConfig>(&data)
     {
-        if let Some(ref mt) = config.model_type
-            && matches!(mt.to_lowercase().as_str(), "qwen3_tts" | "qwen3tts")
-        {
-            return Some(ModelType::Qwen3TTS);
+        if let Some(ref mt) = config.model_type {
+            match mt.to_lowercase().as_str() {
+                "qwen3_tts" | "qwen3tts" => return Some(ModelType::Qwen3TTS),
+                "qwen3_asr" | "qwen3asr" => return Some(ModelType::Qwen3ASR),
+                _ => {},
+            }
         }
         if let Some(ref archs) = config.architectures {
             for arch in archs {
                 let a = arch.to_lowercase();
                 if a.contains("qwen3ttsforconditional") || a.contains("qwen3_tts") {
                     return Some(ModelType::Qwen3TTS);
+                } else if a.contains("qwen3asrforconditional") || a.contains("qwen3_asr") {
+                    return Some(ModelType::Qwen3ASR);
                 }
             }
         }
@@ -114,8 +147,8 @@ pub fn probe_model_type(dir: &Path) -> Option<ModelType> {
     None
 }
 
-/// Auto-detect the TTS model type from `config.json`/`params.json` in the
-/// model directory, falling back to a path-name heuristic.
+/// Auto-detect the TTS/ASR model type from `config.json`/`params.json` in
+/// the model directory, falling back to a path-name heuristic.
 #[must_use]
 pub fn detect_model_type(model_path: &str) -> ModelType {
     let path = Path::new(model_path);
@@ -132,15 +165,17 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
     let path_lower = model_path.to_lowercase();
     if path_lower.contains("voxtral") {
         ModelType::VoxtralTTS
+    } else if path_lower.contains("qwen3-asr") || path_lower.contains("qwen3_asr") {
+        ModelType::Qwen3ASR
     } else {
         tracing::warn!(
-            "Could not auto-detect TTS model type from '{model_path}', defaulting to Qwen3-TTS"
+            "Could not auto-detect model type from '{model_path}', defaulting to Qwen3-TTS"
         );
         ModelType::Qwen3TTS
     }
 }
 
-/// A TTS model discovered by [`discover_models`].
+/// A TTS or ASR model discovered by [`discover_models`]/[`discover_asr_models`].
 #[derive(Debug, PartialEq, Eq)]
 pub struct DiscoveredModel {
     /// Full path to the model directory.
@@ -185,10 +220,62 @@ pub fn discover_models(parent_dir: &Path) -> Result<Vec<DiscoveredModel>> {
                 continue;
             },
         }
-        if let Some(model_type) = probe_model_type(&path) {
+        if let Some(model_type) = probe_model_type(&path)
+            && model_type.is_tts()
+        {
             let name = path
                 .file_name()
                 .map_or_else(|| "tts".to_string(), |n| n.to_string_lossy().into_owned());
+            models.push(DiscoveredModel {
+                path,
+                name,
+                model_type,
+            });
+        }
+    }
+
+    models.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(models)
+}
+
+/// Scan `parent_dir` for immediate subdirectories containing recognized
+/// ASR models.
+///
+/// Identical to [`discover_models`] except it keeps only ASR model types
+/// (see [`ModelType::is_asr`]), so a `--model-path`/`--asr-model-path` pair
+/// pointed at the same parent directory won't cross-load a TTS model as ASR
+/// or vice versa.
+///
+/// # Errors
+///
+/// Returns an error if `parent_dir` cannot be read.
+pub fn discover_asr_models(parent_dir: &Path) -> Result<Vec<DiscoveredModel>> {
+    let entries = std::fs::read_dir(parent_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read model directory '{}': {e}",
+            parent_dir.display()
+        )
+    })?;
+
+    let mut models = Vec::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("cannot read entry in '{}'", parent_dir.display()))?
+            .path();
+        match path.metadata() {
+            Ok(meta) if meta.is_dir() => {},
+            Ok(_) => continue, // not a directory: silently skip, e.g. stray files
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cannot stat entry; skipping");
+                continue;
+            },
+        }
+        if let Some(model_type) = probe_model_type(&path)
+            && model_type.is_asr()
+        {
+            let name = path
+                .file_name()
+                .map_or_else(|| "asr".to_string(), |n| n.to_string_lossy().into_owned());
             models.push(DiscoveredModel {
                 path,
                 name,
@@ -244,14 +331,56 @@ pub fn resolve_models_to_load<'a>(
 //  Factory
 // ─────────────────────────────────────────────────────────────
 
-/// Resolve `ModelType::Auto` to a concrete type.
-#[must_use]
-pub fn resolve(model_type: ModelType, model_path: &str) -> ModelType {
-    if model_type == ModelType::Auto {
-        detect_model_type(model_path)
-    } else {
-        model_type
+/// Resolve `ModelType::Auto` to a concrete TTS type.
+///
+/// If `model_type` isn't `Auto`, it's returned unchanged; [`create_tts`]
+/// performs the actual TTS/ASR family check at construction time.
+///
+/// # Errors
+///
+/// Returns an error if `model_type` is `Auto` and [`detect_model_type`]
+/// identifies the model at `model_path` as an ASR type. Auto-detection has
+/// no way to know a TTS model was expected, so a wrong-family match must be
+/// rejected here rather than deferred to [`create_tts`], where it would
+/// otherwise report a confusing "already resolved" mismatch.
+pub fn resolve_tts(model_type: ModelType, model_path: &str) -> Result<ModelType> {
+    if model_type != ModelType::Auto {
+        return Ok(model_type);
     }
+    let detected = detect_model_type(model_path);
+    if detected.is_asr() {
+        anyhow::bail!(
+            "auto-detected '{model_path}' as ASR model type '{}', but a TTS model was expected",
+            detected.display_name()
+        );
+    }
+    Ok(detected)
+}
+
+/// Resolve `ModelType::Auto` to a concrete ASR type.
+///
+/// If `model_type` isn't `Auto`, it's returned unchanged; [`create_asr`]
+/// performs the actual TTS/ASR family check at construction time.
+///
+/// # Errors
+///
+/// Returns an error if `model_type` is `Auto` and [`detect_model_type`]
+/// identifies the model at `model_path` as a TTS type. Auto-detection has
+/// no way to know an ASR model was expected, so a wrong-family match must be
+/// rejected here rather than deferred to [`create_asr`], where it would
+/// otherwise report a confusing "already resolved" mismatch.
+pub fn resolve_asr(model_type: ModelType, model_path: &str) -> Result<ModelType> {
+    if model_type != ModelType::Auto {
+        return Ok(model_type);
+    }
+    let detected = detect_model_type(model_path);
+    if detected.is_tts() {
+        anyhow::bail!(
+            "auto-detected '{model_path}' as TTS model type '{}', but an ASR model was expected",
+            detected.display_name()
+        );
+    }
+    Ok(detected)
 }
 
 /// Create a TTS model as a trait object.
@@ -281,6 +410,41 @@ pub fn create_tts(
             model_path, device, dtype,
         )?)),
         ModelType::Auto => anyhow::bail!("ModelType::Auto must be resolved before create_tts()"),
+        ModelType::Qwen3ASR => anyhow::bail!(
+            "ModelType::{} is an ASR model type; use create_asr() instead of create_tts()",
+            model_type.display_name()
+        ),
+    }
+}
+
+/// Create an ASR model as a trait object.
+///
+/// Dispatches on [`ModelType`] and returns a `Box<dyn Asr + Send>`, allowing
+/// callers (e.g. [`crate::engine::runtime::ModelRuntime`]) to work with any
+/// ASR model through the [`crane::audio::Asr`] trait without depending on
+/// concrete model types.
+///
+/// # Errors
+///
+/// Returns an error if `model_type` is `Auto` (must be resolved first) or a
+/// TTS type, or if the model fails to load from `model_path`.
+pub fn create_asr(
+    model_type: ModelType,
+    model_path: &str,
+    device: &Device,
+    dtype: &DType,
+) -> Result<Box<dyn crane::audio::Asr + Send>> {
+    tracing::info!("Creating ASR model: {:?}", model_type);
+
+    match model_type {
+        ModelType::Qwen3ASR => Ok(Box::new(crane_core::models::qwen3_asr::Model::new(
+            model_path, device, dtype,
+        )?)),
+        ModelType::Auto => anyhow::bail!("ModelType::Auto must be resolved before create_asr()"),
+        ModelType::Qwen3TTS | ModelType::VoxtralTTS => anyhow::bail!(
+            "ModelType::{} is a TTS model type; use create_tts() instead of create_asr()",
+            model_type.display_name()
+        ),
     }
 }
 
@@ -308,6 +472,15 @@ mod tests {
     }
 
     #[test]
+    fn model_type_from_str_qwen3_asr_variants() {
+        assert_eq!(ModelType::from_str("qwen3_asr"), ModelType::Qwen3ASR);
+        assert_eq!(ModelType::from_str("qwen3asr"), ModelType::Qwen3ASR);
+        assert_eq!(ModelType::from_str("qwen3-asr"), ModelType::Qwen3ASR);
+        assert_eq!(ModelType::from_str("asr"), ModelType::Qwen3ASR);
+        assert_eq!(ModelType::from_str("QWEN3_ASR"), ModelType::Qwen3ASR);
+    }
+
+    #[test]
     fn model_type_from_str_auto_fallback() {
         assert_eq!(ModelType::from_str("auto"), ModelType::Auto);
         assert_eq!(ModelType::from_str("unknown"), ModelType::Auto);
@@ -319,6 +492,20 @@ mod tests {
         assert_eq!(ModelType::Auto.display_name(), "auto");
         assert_eq!(ModelType::Qwen3TTS.display_name(), "qwen3_tts");
         assert_eq!(ModelType::VoxtralTTS.display_name(), "voxtral_tts");
+        assert_eq!(ModelType::Qwen3ASR.display_name(), "qwen3_asr");
+    }
+
+    #[test]
+    fn model_type_is_tts_and_is_asr() {
+        assert!(ModelType::Qwen3TTS.is_tts());
+        assert!(ModelType::VoxtralTTS.is_tts());
+        assert!(!ModelType::Qwen3ASR.is_tts());
+        assert!(!ModelType::Auto.is_tts());
+
+        assert!(ModelType::Qwen3ASR.is_asr());
+        assert!(!ModelType::Qwen3TTS.is_asr());
+        assert!(!ModelType::VoxtralTTS.is_asr());
+        assert!(!ModelType::Auto.is_asr());
     }
 
     // ── detect_model_type with temp files ──
@@ -361,24 +548,85 @@ mod tests {
     }
 
     #[test]
+    fn detect_from_config_json_model_type_qwen3_asr() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"model_type": "qwen3_asr"}"#).unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Qwen3ASR);
+    }
+
+    #[test]
+    fn detect_from_config_json_architectures_qwen3_asr() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(
+            &config,
+            r#"{"architectures": ["Qwen3ASRForConditionalGeneration"]}"#,
+        )
+        .unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Qwen3ASR);
+    }
+
+    #[test]
+    fn detect_path_heuristic_qwen3_asr() {
+        let result = detect_model_type("/models/Qwen3-ASR-0.6B-hf");
+        assert_eq!(result, ModelType::Qwen3ASR);
+    }
+
+    #[test]
     fn detect_fallback_unknown_defaults_to_qwen3_tts() {
         let dir = tempfile::tempdir().unwrap();
         let result = detect_model_type(dir.path().to_str().unwrap());
         assert_eq!(result, ModelType::Qwen3TTS);
     }
 
-    // ── resolve ──
+    // ── resolve_tts / resolve_asr ──
 
     #[test]
-    fn resolve_auto_delegates_to_detect() {
-        let result = resolve(ModelType::Auto, "/models/Voxtral-4B-TTS-2603");
+    fn resolve_tts_auto_delegates_to_detect() {
+        let result = resolve_tts(ModelType::Auto, "/models/Voxtral-4B-TTS-2603").unwrap();
         assert_eq!(result, ModelType::VoxtralTTS);
     }
 
     #[test]
-    fn resolve_explicit_type_is_passthrough() {
-        let result = resolve(ModelType::Qwen3TTS, "/models/whatever");
+    fn resolve_tts_explicit_type_is_passthrough() {
+        let result = resolve_tts(ModelType::Qwen3TTS, "/models/whatever").unwrap();
         assert_eq!(result, ModelType::Qwen3TTS);
+    }
+
+    #[test]
+    fn resolve_tts_rejects_auto_detected_asr() {
+        let err = resolve_tts(ModelType::Auto, "/models/Qwen3-ASR-0.6B-hf").unwrap_err();
+        assert!(err.to_string().contains("TTS model was expected"));
+    }
+
+    #[test]
+    fn resolve_asr_auto_delegates_to_detect() {
+        let result = resolve_asr(ModelType::Auto, "/models/Qwen3-ASR-0.6B-hf").unwrap();
+        assert_eq!(result, ModelType::Qwen3ASR);
+    }
+
+    #[test]
+    fn resolve_asr_explicit_type_is_passthrough() {
+        let result = resolve_asr(ModelType::Qwen3ASR, "/models/whatever").unwrap();
+        assert_eq!(result, ModelType::Qwen3ASR);
+    }
+
+    #[test]
+    fn resolve_asr_rejects_auto_detected_tts() {
+        let err = resolve_asr(ModelType::Auto, "/models/Voxtral-4B-TTS-2603").unwrap_err();
+        assert!(err.to_string().contains("ASR model was expected"));
+    }
+
+    #[test]
+    fn resolve_asr_rejects_unrecognized_path_defaulting_to_tts() {
+        // detect_model_type falls back to Qwen3TTS for anything it can't
+        // recognize; resolve_asr must reject that fallback rather than
+        // silently handing an ASR caller a TTS type.
+        let err = resolve_asr(ModelType::Auto, "/models/mystery-model").unwrap_err();
+        assert!(err.to_string().contains("ASR model was expected"));
     }
 
     // ── create_tts ──
@@ -395,6 +643,61 @@ mod tests {
             panic!("expected create_tts to reject ModelType::Auto");
         };
         assert!(err.to_string().contains("must be resolved"));
+    }
+
+    #[test]
+    fn create_tts_rejects_asr_type() {
+        let result = create_tts(
+            ModelType::Qwen3ASR,
+            "/models/whatever",
+            &Device::Cpu,
+            &DType::F32,
+        );
+        let Err(err) = result else {
+            panic!("expected create_tts to reject ModelType::Qwen3ASR");
+        };
+        assert!(err.to_string().contains("create_asr()"));
+    }
+
+    // ── create_asr ──
+
+    #[test]
+    fn create_asr_rejects_auto() {
+        let result = create_asr(
+            ModelType::Auto,
+            "/models/whatever",
+            &Device::Cpu,
+            &DType::F32,
+        );
+        let Err(err) = result else {
+            panic!("expected create_asr to reject ModelType::Auto");
+        };
+        assert!(err.to_string().contains("must be resolved"));
+    }
+
+    #[test]
+    fn create_asr_rejects_tts_type() {
+        let result = create_asr(
+            ModelType::Qwen3TTS,
+            "/models/whatever",
+            &Device::Cpu,
+            &DType::F32,
+        );
+        let Err(err) = result else {
+            panic!("expected create_asr to reject ModelType::Qwen3TTS");
+        };
+        assert!(err.to_string().contains("create_tts()"));
+
+        let result = create_asr(
+            ModelType::VoxtralTTS,
+            "/models/whatever",
+            &Device::Cpu,
+            &DType::F32,
+        );
+        let Err(err) = result else {
+            panic!("expected create_asr to reject ModelType::VoxtralTTS");
+        };
+        assert!(err.to_string().contains("create_tts()"));
     }
 
     // ── probe_model_type ──
@@ -419,6 +722,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(probe_model_type(dir.path()), Some(ModelType::VoxtralTTS));
+    }
+
+    #[test]
+    fn probe_from_config_json_qwen3_asr() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "qwen3_asr"}"#,
+        )
+        .unwrap();
+        assert_eq!(probe_model_type(dir.path()), Some(ModelType::Qwen3ASR));
+    }
+
+    #[test]
+    fn probe_from_config_json_architectures_qwen3_asr() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"architectures": ["Qwen3ASRForConditionalGeneration"]}"#,
+        )
+        .unwrap();
+        assert_eq!(probe_model_type(dir.path()), Some(ModelType::Qwen3ASR));
     }
 
     #[test]
@@ -472,6 +797,28 @@ mod tests {
         assert_eq!(models[0].model_type, ModelType::Qwen3TTS);
         assert_eq!(models[1].name, "voxtral");
         assert_eq!(models[1].model_type, ModelType::VoxtralTTS);
+    }
+
+    #[test]
+    fn discover_models_skips_asr_models() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("qwen-tts")).unwrap();
+        std::fs::write(
+            dir.path().join("qwen-tts/config.json"),
+            r#"{"model_type": "qwen3_tts"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("qwen-asr")).unwrap();
+        std::fs::write(
+            dir.path().join("qwen-asr/config.json"),
+            r#"{"model_type": "qwen3_asr"}"#,
+        )
+        .unwrap();
+
+        let models = discover_models(dir.path()).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "qwen-tts");
+        assert_eq!(models[0].model_type, ModelType::Qwen3TTS);
     }
 
     #[test]
@@ -531,6 +878,70 @@ mod tests {
         let models = discover_models(dir.path()).unwrap();
         let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, vec!["linked-model", "real-model"]);
+    }
+
+    // ── discover_asr_models ──
+
+    #[test]
+    fn discover_asr_models_finds_asr_skips_tts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("qwen-tts")).unwrap();
+        std::fs::write(
+            dir.path().join("qwen-tts/config.json"),
+            r#"{"model_type": "qwen3_tts"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("qwen-asr")).unwrap();
+        std::fs::write(
+            dir.path().join("qwen-asr/config.json"),
+            r#"{"model_type": "qwen3_asr"}"#,
+        )
+        .unwrap();
+
+        let models = discover_asr_models(dir.path()).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "qwen-asr");
+        assert_eq!(models[0].model_type, ModelType::Qwen3ASR);
+    }
+
+    #[test]
+    fn discover_asr_models_sorted_alphabetically() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["c", "a", "b"] {
+            let sub = dir.path().join(name);
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(sub.join("config.json"), r#"{"model_type": "qwen3_asr"}"#).unwrap();
+        }
+
+        let models = discover_asr_models(dir.path()).unwrap();
+        let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn discover_asr_models_empty_when_only_tts_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("qwen-tts")).unwrap();
+        std::fs::write(
+            dir.path().join("qwen-tts/config.json"),
+            r#"{"model_type": "qwen3_tts"}"#,
+        )
+        .unwrap();
+
+        let models = discover_asr_models(dir.path()).unwrap();
+        assert_eq!(models, vec![]);
+    }
+
+    #[test]
+    fn discover_asr_models_empty_dir_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(discover_asr_models(dir.path()).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn discover_asr_models_nonexistent_dir_errors() {
+        let result = discover_asr_models(Path::new("/nonexistent/parent/dir"));
+        assert!(result.is_err());
     }
 
     // ── resolve_models_to_load ──

@@ -302,7 +302,7 @@ impl ModelRuntime {
     ///
     /// Returns an error if the model fails to load.
     pub fn load_tts(&mut self, model_path: &str, device: &Device, dtype: &DType) -> Result<String> {
-        let resolved_type = model_factory::resolve(ModelType::Auto, model_path);
+        let resolved_type = model_factory::resolve_tts(ModelType::Auto, model_path)?;
         let tts = model_factory::create_tts(resolved_type, model_path, device, dtype)?;
         let name = extract_model_name(model_path);
 
