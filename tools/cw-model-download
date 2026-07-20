@@ -3,12 +3,13 @@
 # requires-python = ">=3.9"
 # dependencies = ["huggingface_hub"]
 # ///
-"""Download crane-wyoming TTS models from Hugging Face.
+"""Download crane-wyoming TTS and ASR models from Hugging Face.
 
 Examples:
     ./cw-model-download --list
     ./cw-model-download --model voxtral --path /srv/models
     ./cw-model-download --model qwen3-tts-customvoice-1.7b --path ~/models --token hf_...
+    ./cw-model-download --model qwen3-asr-0.6b --path ~/models
 
 Run directly (uv picks up the inline metadata above and manages the
 `huggingface_hub` dependency in an ephemeral venv, no setup needed):
@@ -32,31 +33,60 @@ MODELS = {
     "qwen3-tts-base": {
         "repo_id": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
         "dirname": "Qwen3-TTS-12Hz-0.6B-Base",
+        "kind": "tts",
         "description": "Qwen3-TTS 0.6B, voice cloning via reference audio (Apache-2.0)",
     },
     "qwen3-tts-customvoice-0.6b": {
         "repo_id": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
         "dirname": "Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        "kind": "tts",
         "description": "Qwen3-TTS 0.6B, predefined speakers (Apache-2.0)",
     },
     "qwen3-tts-customvoice-1.7b": {
         "repo_id": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         "dirname": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "kind": "tts",
         "description": "Qwen3-TTS 1.7B, predefined speakers (Apache-2.0)",
     },
     "voxtral": {
         "repo_id": "mistralai/Voxtral-4B-TTS-2603",
         "dirname": "Voxtral-4B-TTS-2603",
+        "kind": "tts",
         "description": "Voxtral 4B, 10 languages / 20 voices (CC-BY-NC-4.0)",
     },
+    "qwen3-asr-0.6b": {
+        "repo_id": "Qwen/Qwen3-ASR-0.6B-hf",
+        "dirname": "Qwen3-ASR-0.6B-hf",
+        "kind": "asr",
+        "description": "Qwen3-ASR 0.6B, speech-to-text (Apache-2.0)",
+    },
+    "qwen3-asr-1.7b": {
+        "repo_id": "Qwen/Qwen3-ASR-1.7B-hf",
+        "dirname": "Qwen3-ASR-1.7B-hf",
+        "kind": "asr",
+        "description": "Qwen3-ASR 1.7B, speech-to-text (Apache-2.0)",
+    },
 }
+
+_VALID_KINDS = ("tts", "asr")
+_REQUIRED_KEYS = ("repo_id", "dirname", "kind", "description")
+for _key, _info in MODELS.items():
+    _missing = [k for k in _REQUIRED_KEYS if k not in _info]
+    if _missing:
+        raise ValueError(f"MODELS[{_key!r}] is missing required key(s): {_missing}")
+    if _info["kind"] not in _VALID_KINDS:
+        raise ValueError(
+            f"MODELS[{_key!r}] has invalid kind {_info['kind']!r}; "
+            f"expected one of {_VALID_KINDS}"
+        )
 
 
 def list_models():
     print("Available models:\n")
     width = max(len(key) for key in MODELS)
     for key, info in MODELS.items():
-        print(f"  {key:<{width}}  {info['description']}")
+        kind = info["kind"].upper()
+        print(f"  {key:<{width}}  [{kind}]  {info['description']}")
 
 
 def download_model(model_key, path, token):
@@ -89,16 +119,18 @@ def download_model(model_key, path, token):
             )
         sys.exit(1)
 
-    print(f"\nDone. Use with: crane-wyoming --model-path {os.path.expanduser(path)}")
+    flag = "--asr-model-path" if info["kind"] == "asr" else "--model-path"
+    print(f"\nDone. Use with: crane-wyoming {flag} {os.path.expanduser(path)}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download TTS models for crane-wyoming from Hugging Face.",
+        description="Download TTS and ASR models for crane-wyoming from Hugging Face.",
         epilog="examples:\n"
         "  cw-model-download --list\n"
         "  cw-model-download --model voxtral --path /srv/models\n"
-        "  cw-model-download --model qwen3-tts-customvoice-1.7b --path ~/models --token hf_...\n",
+        "  cw-model-download --model qwen3-tts-customvoice-1.7b --path ~/models --token hf_...\n"
+        "  cw-model-download --model qwen3-asr-0.6b --path ~/models\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     group = parser.add_mutually_exclusive_group(required=True)

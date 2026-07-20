@@ -83,7 +83,7 @@ This produces three binaries under `target/release/`: `crane-wyoming`,
 
 ## Downloading models
 
-`tools/cw-model-download` fetches TTS model weights from [Hugging
+`tools/cw-model-download` fetches TTS and ASR model weights from [Hugging
 Face](https://huggingface.co/). It's a self-contained script so
 [`uv`](https://docs.astral.sh/uv/) can run it in an ephemeral venv with no
 setup:
