@@ -179,6 +179,44 @@ impl SynthesizeData {
     }
 }
 
+/// Data for a `transcribe` event (ASR request).
+///
+/// `context` and `vad_sensitivity` from the upstream Wyoming schema are
+/// not yet modeled; extend this struct when ASR context/VAD support
+/// lands.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct TranscribeData {
+    /// Model name to use for transcription.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Language hint for transcription.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+impl TranscribeData {
+    /// Creates a new `TranscribeData` with no fields set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the model name to use for transcription.
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Sets the language hint for transcription.
+    #[must_use]
+    pub fn with_language(mut self, language: impl Into<String>) -> Self {
+        self.language = Some(language.into());
+        self
+    }
+}
+
 /// Data for a `ping` event.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -318,6 +356,8 @@ pub enum Event {
     AudioStop(AudioStopData),
     /// Request to synthesize speech from text.
     Synthesize(SynthesizeData),
+    /// Request to transcribe speech to text.
+    Transcribe(TranscribeData),
     /// Request for service information. No data, no payload.
     Describe,
     /// Service information response.
@@ -351,6 +391,8 @@ pub const TYPE_AUDIO_CHUNK: &str = "audio-chunk";
 pub const TYPE_AUDIO_STOP: &str = "audio-stop";
 /// Wire-format type string for `synthesize` events.
 pub const TYPE_SYNTHESIZE: &str = "synthesize";
+/// Wire-format type string for `transcribe` events.
+pub const TYPE_TRANSCRIBE: &str = "transcribe";
 /// Wire-format type string for `describe` events.
 pub const TYPE_DESCRIBE: &str = "describe";
 /// Wire-format type string for `info` events.
@@ -371,6 +413,7 @@ impl Event {
             Event::AudioChunk { .. } => TYPE_AUDIO_CHUNK,
             Event::AudioStop(_) => TYPE_AUDIO_STOP,
             Event::Synthesize(_) => TYPE_SYNTHESIZE,
+            Event::Transcribe(_) => TYPE_TRANSCRIBE,
             Event::Describe => TYPE_DESCRIBE,
             Event::Info(_) => TYPE_INFO,
             Event::Ping(_) => TYPE_PING,
@@ -394,6 +437,7 @@ impl Event {
             Event::AudioChunk { data, .. } => Some(to_json_vec(data)?),
             Event::AudioStop(data) => Some(to_json_vec(data)?),
             Event::Synthesize(data) => Some(to_json_vec(data)?),
+            Event::Transcribe(data) => Some(to_json_vec(data)?),
             Event::Describe => None,
             Event::Info(data) => Some(to_json_vec(data)?),
             Event::Ping(data) => Some(to_json_vec(data)?),
@@ -456,6 +500,7 @@ impl Event {
             },
             TYPE_AUDIO_STOP => Event::AudioStop(from_json_value(data)?),
             TYPE_SYNTHESIZE => Event::Synthesize(from_json_value(data)?),
+            TYPE_TRANSCRIBE => Event::Transcribe(from_json_value(data)?),
             TYPE_DESCRIBE => Event::Describe,
             TYPE_INFO => Event::Info(from_json_value(data)?),
             TYPE_PING => Event::Ping(from_json_value(data)?),
@@ -577,6 +622,34 @@ mod tests {
     }
 
     #[test]
+    fn test_transcribe_round_trip() {
+        let event = Event::Transcribe(TranscribeData {
+            name: Some("Qwen3-ASR".to_string()),
+            language: Some("en".to_string()),
+        });
+        assert_eq!(round_trip(&event), event);
+    }
+
+    #[test]
+    fn test_transcribe_minimal() {
+        let event = Event::Transcribe(TranscribeData::default());
+        assert_eq!(round_trip(&event), event);
+    }
+
+    #[test]
+    fn test_transcribe_name_only() {
+        let event = Event::Transcribe(TranscribeData {
+            name: Some("Qwen3-ASR".to_string()),
+            language: None,
+        });
+        assert_eq!(round_trip(&event), event);
+        let bytes = event.serialize_data().unwrap().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("name"));
+        assert!(!text.contains("language"));
+    }
+
+    #[test]
     fn test_describe_round_trip() {
         let event = Event::Describe;
         assert_eq!(event.serialize_data().unwrap(), None);
@@ -655,6 +728,10 @@ mod tests {
         assert_eq!(
             Event::AudioStop(AudioStopData { timestamp: None }).event_type(),
             "audio-stop"
+        );
+        assert_eq!(
+            Event::Transcribe(TranscribeData::default()).event_type(),
+            "transcribe"
         );
     }
 }

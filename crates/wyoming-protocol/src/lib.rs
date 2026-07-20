@@ -23,11 +23,11 @@
 //! # Event scope
 //!
 //! This crate intentionally models only the subset of Wyoming events
-//! needed for TTS service integration: `synthesize`, `audio-start`,
-//! `audio-chunk`, `audio-stop`, `describe`/`info`, `ping`/`pong`, and
-//! `error`. ASR, wake-word, and intent events are not included.
-//! Unrecognized event types are preserved as [`Event::Unknown`] for
-//! forward compatibility.
+//! needed for TTS and ASR service integration: `synthesize`,
+//! `audio-start`, `audio-chunk`, `audio-stop`, `transcribe`,
+//! `describe`/`info`, `ping`/`pong`, and `error`. Wake-word and intent
+//! events are not included. Unrecognized event types are preserved as
+//! [`Event::Unknown`] for forward compatibility.
 //!
 //! # Module layout
 //!
