@@ -249,6 +249,49 @@ impl TranscriptData {
     }
 }
 
+/// Data for a `transcript-start` event (streaming ASR mode only).
+///
+/// `context` from the upstream Wyoming schema is not yet modeled; extend
+/// this struct when ASR context support lands.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct TranscriptStartData {
+    /// Language of the transcription.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+impl TranscriptStartData {
+    /// Creates a new `TranscriptStartData` with no language set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the language of the transcription.
+    #[must_use]
+    pub fn with_language(mut self, language: impl Into<String>) -> Self {
+        self.language = Some(language.into());
+        self
+    }
+}
+
+/// Data for a `transcript-chunk` event (streaming ASR mode only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct TranscriptChunkData {
+    /// Partial transcript text.
+    pub text: String,
+}
+
+impl TranscriptChunkData {
+    /// Creates a new `TranscriptChunkData` with the given partial text.
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+}
+
 /// Data for a `ping` event.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -392,6 +435,13 @@ pub enum Event {
     Transcribe(TranscribeData),
     /// Result of transcribing speech to text.
     Transcript(TranscriptData),
+    /// Streaming transcription has started (streaming ASR mode only).
+    TranscriptStart(TranscriptStartData),
+    /// A partial transcript chunk (streaming ASR mode only).
+    TranscriptChunk(TranscriptChunkData),
+    /// Streaming transcription has stopped (streaming ASR mode only). No
+    /// data, no payload.
+    TranscriptStop,
     /// Request for service information. No data, no payload.
     Describe,
     /// Service information response.
@@ -429,6 +479,12 @@ pub const TYPE_SYNTHESIZE: &str = "synthesize";
 pub const TYPE_TRANSCRIBE: &str = "transcribe";
 /// Wire-format type string for `transcript` events.
 pub const TYPE_TRANSCRIPT: &str = "transcript";
+/// Wire-format type string for `transcript-start` events.
+pub const TYPE_TRANSCRIPT_START: &str = "transcript-start";
+/// Wire-format type string for `transcript-chunk` events.
+pub const TYPE_TRANSCRIPT_CHUNK: &str = "transcript-chunk";
+/// Wire-format type string for `transcript-stop` events.
+pub const TYPE_TRANSCRIPT_STOP: &str = "transcript-stop";
 /// Wire-format type string for `describe` events.
 pub const TYPE_DESCRIBE: &str = "describe";
 /// Wire-format type string for `info` events.
@@ -451,6 +507,9 @@ impl Event {
             Event::Synthesize(_) => TYPE_SYNTHESIZE,
             Event::Transcribe(_) => TYPE_TRANSCRIBE,
             Event::Transcript(_) => TYPE_TRANSCRIPT,
+            Event::TranscriptStart(_) => TYPE_TRANSCRIPT_START,
+            Event::TranscriptChunk(_) => TYPE_TRANSCRIPT_CHUNK,
+            Event::TranscriptStop => TYPE_TRANSCRIPT_STOP,
             Event::Describe => TYPE_DESCRIBE,
             Event::Info(_) => TYPE_INFO,
             Event::Ping(_) => TYPE_PING,
@@ -476,7 +535,9 @@ impl Event {
             Event::Synthesize(data) => Some(to_json_vec(data)?),
             Event::Transcribe(data) => Some(to_json_vec(data)?),
             Event::Transcript(data) => Some(to_json_vec(data)?),
-            Event::Describe => None,
+            Event::TranscriptStart(data) => Some(to_json_vec(data)?),
+            Event::TranscriptChunk(data) => Some(to_json_vec(data)?),
+            Event::TranscriptStop | Event::Describe => None,
             Event::Info(data) => Some(to_json_vec(data)?),
             Event::Ping(data) => Some(to_json_vec(data)?),
             Event::Pong(data) => Some(to_json_vec(data)?),
@@ -540,6 +601,9 @@ impl Event {
             TYPE_SYNTHESIZE => Event::Synthesize(from_json_value(data)?),
             TYPE_TRANSCRIBE => Event::Transcribe(from_json_value(data)?),
             TYPE_TRANSCRIPT => Event::Transcript(from_json_value(data)?),
+            TYPE_TRANSCRIPT_START => Event::TranscriptStart(from_json_value(data)?),
+            TYPE_TRANSCRIPT_CHUNK => Event::TranscriptChunk(from_json_value(data)?),
+            TYPE_TRANSCRIPT_STOP => Event::TranscriptStop,
             TYPE_DESCRIBE => Event::Describe,
             TYPE_INFO => Event::Info(from_json_value(data)?),
             TYPE_PING => Event::Ping(from_json_value(data)?),
@@ -715,6 +779,82 @@ mod tests {
     }
 
     #[test]
+    fn test_transcript_start_round_trip() {
+        let event = Event::TranscriptStart(TranscriptStartData {
+            language: Some("en".to_string()),
+        });
+        assert_eq!(round_trip(&event), event);
+    }
+
+    #[test]
+    fn test_transcript_start_minimal() {
+        let event = Event::TranscriptStart(TranscriptStartData::default());
+        assert_eq!(round_trip(&event), event);
+        // All fields unset serializes to `{}`, which carries no
+        // information and is collapsed to "no data segment" by
+        // `serialize_data`, same as `AudioStopData`/`PingData` with all
+        // fields unset.
+        assert_eq!(event.serialize_data().unwrap(), None);
+    }
+
+    #[test]
+    fn test_transcript_start_language_only() {
+        let event = Event::TranscriptStart(TranscriptStartData {
+            language: Some("en".to_string()),
+        });
+        assert_eq!(round_trip(&event), event);
+        let bytes = event.serialize_data().unwrap().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("language"));
+    }
+
+    #[test]
+    fn test_transcript_start_tolerates_unknown_fields() {
+        // Upstream `TranscriptStart` also carries a `context` field that
+        // this crate intentionally doesn't model; unknown fields must be
+        // ignored rather than rejected, per `Event::Unknown`'s forward-
+        // compatibility contract.
+        let data = json!({"language": "en", "context": {"foo": "bar"}});
+        let event = Event::from_wire(TYPE_TRANSCRIPT_START, data, None).unwrap();
+        assert_eq!(
+            event,
+            Event::TranscriptStart(TranscriptStartData {
+                language: Some("en".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn test_transcript_chunk_round_trip() {
+        let event = Event::TranscriptChunk(TranscriptChunkData::new("hel"));
+        assert_eq!(round_trip(&event), event);
+        let bytes = event.serialize_data().unwrap().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("text"));
+    }
+
+    #[test]
+    fn test_transcript_chunk_empty_text() {
+        let event = Event::TranscriptChunk(TranscriptChunkData::new(""));
+        assert_eq!(round_trip(&event), event);
+    }
+
+    #[test]
+    fn test_transcript_chunk_missing_text_is_error() {
+        let err = Event::from_wire(TYPE_TRANSCRIPT_CHUNK, json!({}), None)
+            .expect_err("missing required `text` field must fail to deserialize");
+        assert!(matches!(err, ProtocolError::InvalidEventData(_)));
+    }
+
+    #[test]
+    fn test_transcript_stop_round_trip() {
+        let event = Event::TranscriptStop;
+        assert_eq!(event.serialize_data().unwrap(), None);
+        assert_eq!(event.payload(), None);
+        assert_eq!(round_trip(&event), event);
+    }
+
+    #[test]
     fn test_describe_round_trip() {
         let event = Event::Describe;
         assert_eq!(event.serialize_data().unwrap(), None);
@@ -802,5 +942,14 @@ mod tests {
             Event::Transcript(TranscriptData::new("hi")).event_type(),
             "transcript"
         );
+        assert_eq!(
+            Event::TranscriptStart(TranscriptStartData::default()).event_type(),
+            "transcript-start"
+        );
+        assert_eq!(
+            Event::TranscriptChunk(TranscriptChunkData::new("hi")).event_type(),
+            "transcript-chunk"
+        );
+        assert_eq!(Event::TranscriptStop.event_type(), "transcript-stop");
     }
 }
