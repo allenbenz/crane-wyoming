@@ -405,6 +405,13 @@ impl InfoData {
         self.tts = tts;
         self
     }
+
+    /// Sets the ASR service descriptors.
+    #[must_use]
+    pub fn with_asr(mut self, asr: Vec<serde_json::Value>) -> Self {
+        self.asr = asr;
+        self
+    }
 }
 
 /// A Wyoming protocol event.
@@ -869,6 +876,18 @@ mod tests {
             asr: vec![],
             wake: vec![],
         });
+        assert_eq!(round_trip(&event), event);
+    }
+
+    #[test]
+    fn test_info_with_asr_round_trip() {
+        let event = Event::Info(
+            InfoData::new()
+                .with_tts(vec![json!({"name": "Qwen3-TTS"})])
+                .with_asr(vec![
+                    json!({"name": "Qwen3-ASR", "supports_transcript_streaming": false}),
+                ]),
+        );
         assert_eq!(round_trip(&event), event);
     }
 
