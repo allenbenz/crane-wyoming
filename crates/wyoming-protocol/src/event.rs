@@ -217,6 +217,38 @@ impl TranscribeData {
     }
 }
 
+/// Data for a `transcript` event (ASR result).
+///
+/// `context` from the upstream Wyoming schema is not yet modeled; extend
+/// this struct when ASR context support lands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct TranscriptData {
+    /// Transcribed text.
+    pub text: String,
+    /// Language of the transcription.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+impl TranscriptData {
+    /// Creates a new `TranscriptData` with the given text and no language.
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            language: None,
+        }
+    }
+
+    /// Sets the language of the transcription.
+    #[must_use]
+    pub fn with_language(mut self, language: impl Into<String>) -> Self {
+        self.language = Some(language.into());
+        self
+    }
+}
+
 /// Data for a `ping` event.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -358,6 +390,8 @@ pub enum Event {
     Synthesize(SynthesizeData),
     /// Request to transcribe speech to text.
     Transcribe(TranscribeData),
+    /// Result of transcribing speech to text.
+    Transcript(TranscriptData),
     /// Request for service information. No data, no payload.
     Describe,
     /// Service information response.
@@ -393,6 +427,8 @@ pub const TYPE_AUDIO_STOP: &str = "audio-stop";
 pub const TYPE_SYNTHESIZE: &str = "synthesize";
 /// Wire-format type string for `transcribe` events.
 pub const TYPE_TRANSCRIBE: &str = "transcribe";
+/// Wire-format type string for `transcript` events.
+pub const TYPE_TRANSCRIPT: &str = "transcript";
 /// Wire-format type string for `describe` events.
 pub const TYPE_DESCRIBE: &str = "describe";
 /// Wire-format type string for `info` events.
@@ -414,6 +450,7 @@ impl Event {
             Event::AudioStop(_) => TYPE_AUDIO_STOP,
             Event::Synthesize(_) => TYPE_SYNTHESIZE,
             Event::Transcribe(_) => TYPE_TRANSCRIBE,
+            Event::Transcript(_) => TYPE_TRANSCRIPT,
             Event::Describe => TYPE_DESCRIBE,
             Event::Info(_) => TYPE_INFO,
             Event::Ping(_) => TYPE_PING,
@@ -438,6 +475,7 @@ impl Event {
             Event::AudioStop(data) => Some(to_json_vec(data)?),
             Event::Synthesize(data) => Some(to_json_vec(data)?),
             Event::Transcribe(data) => Some(to_json_vec(data)?),
+            Event::Transcript(data) => Some(to_json_vec(data)?),
             Event::Describe => None,
             Event::Info(data) => Some(to_json_vec(data)?),
             Event::Ping(data) => Some(to_json_vec(data)?),
@@ -501,6 +539,7 @@ impl Event {
             TYPE_AUDIO_STOP => Event::AudioStop(from_json_value(data)?),
             TYPE_SYNTHESIZE => Event::Synthesize(from_json_value(data)?),
             TYPE_TRANSCRIBE => Event::Transcribe(from_json_value(data)?),
+            TYPE_TRANSCRIPT => Event::Transcript(from_json_value(data)?),
             TYPE_DESCRIBE => Event::Describe,
             TYPE_INFO => Event::Info(from_json_value(data)?),
             TYPE_PING => Event::Ping(from_json_value(data)?),
@@ -650,6 +689,32 @@ mod tests {
     }
 
     #[test]
+    fn test_transcript_round_trip() {
+        let event = Event::Transcript(TranscriptData {
+            text: "hello world".to_string(),
+            language: Some("en".to_string()),
+        });
+        assert_eq!(round_trip(&event), event);
+    }
+
+    #[test]
+    fn test_transcript_minimal() {
+        let event = Event::Transcript(TranscriptData::new("hi"));
+        assert_eq!(
+            event,
+            Event::Transcript(TranscriptData {
+                text: "hi".to_string(),
+                language: None,
+            })
+        );
+        assert_eq!(round_trip(&event), event);
+        let bytes = event.serialize_data().unwrap().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("text"));
+        assert!(!text.contains("language"));
+    }
+
+    #[test]
     fn test_describe_round_trip() {
         let event = Event::Describe;
         assert_eq!(event.serialize_data().unwrap(), None);
@@ -732,6 +797,10 @@ mod tests {
         assert_eq!(
             Event::Transcribe(TranscribeData::default()).event_type(),
             "transcribe"
+        );
+        assert_eq!(
+            Event::Transcript(TranscriptData::new("hi")).event_type(),
+            "transcript"
         );
     }
 }
