@@ -19,7 +19,7 @@ use candle_core::{DType, Tensor};
 use crane::audio::{AudioInfo, pcm_f32_to_i16, pcm_i16_to_f32};
 use crane_core::generation::SpeechOptions;
 
-use crate::engine::{AsrTranscribeRequest, ModelRuntime, TtsGenerateRequest, TtsHandle};
+use crate::engine::{AsrHandle, AsrTranscribeRequest, ModelRuntime, TtsGenerateRequest, TtsHandle};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::oneshot;
 
@@ -385,7 +385,7 @@ where
                 handle_transcribe(reader, writer, runtime, asr_map, data).await?;
             },
             Event::Ping(data) => handle_ping(writer, data).await?,
-            Event::Describe => handle_describe(writer, runtime, voice_map).await?,
+            Event::Describe => handle_describe(writer, runtime, voice_map, asr_map).await?,
             Event::Unknown { event_type, .. } => {
                 tracing::warn!(event_type = %event_type, "Unknown event type");
                 send_error(
@@ -1086,20 +1086,23 @@ where
 /// Answer a `describe` event with service discovery info.
 ///
 /// Lists every TTS model registered in `runtime` as a `tts` program
-/// descriptor, including its voices. The `asr` and `wake` lists are always
-/// empty: `--asr-model-path` (which will populate a non-empty
-/// [`AsrModelMap`]) isn't implemented yet, and wake-word models aren't
-/// served over Wyoming at all. TODO: once `--asr-model-path` lands, list
-/// loaded ASR models here too, analogous to the `tts` list.
+/// descriptor, including its voices, and every ASR model as an `asr`
+/// program descriptor. The `wake` list is always empty: wake-word models
+/// aren't served over Wyoming at all.
 async fn handle_describe<W>(
     writer: &mut W,
     runtime: &ModelRuntime,
     voice_map: &VoiceMap,
+    asr_map: &AsrModelMap,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    write_event(writer, &Event::Info(build_info(runtime, voice_map))).await?;
+    write_event(
+        writer,
+        &Event::Info(build_info(runtime, voice_map, asr_map)),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1111,9 +1114,9 @@ fn crane_attribution() -> serde_json::Value {
     })
 }
 
-/// Build the `info` event data from registered TTS models.
+/// Build the `info` event data from registered TTS and ASR models.
 ///
-/// Each model becomes a `TtsProgram`-shaped JSON value (see the Wyoming
+/// Each TTS model becomes a `TtsProgram`-shaped JSON value (see the Wyoming
 /// `wyoming/info.py` schema), named after its registration name so two
 /// loaded models of the same architecture don't collide. Voices claimed by
 /// an earlier-priority model (per `voice_map`'s "first model wins" rule)
@@ -1121,7 +1124,12 @@ fn crane_attribution() -> serde_json::Value {
 /// same voice name twice under different programs. Models present in
 /// `runtime` but not part of `voice_map`'s configured set are skipped
 /// entirely, since they would otherwise show up with an empty voice list.
-fn build_info(runtime: &ModelRuntime, voice_map: &VoiceMap) -> InfoData {
+///
+/// Each ASR model becomes an `AsrProgram`-shaped JSON value, similarly
+/// named after its registration name and skipped if not part of
+/// `asr_map`'s configured set. `languages` is always empty for now -- see
+/// "Language support (or the current lack of it)" in `ASR.md`.
+fn build_info(runtime: &ModelRuntime, voice_map: &VoiceMap, asr_map: &AsrModelMap) -> InfoData {
     let streaming_enabled = runtime.streaming_enabled();
     let mut models: Vec<(&str, &TtsHandle)> = runtime.tts_handles().collect();
     models.sort_by_key(|(name, _)| *name);
@@ -1168,7 +1176,38 @@ fn build_info(runtime: &ModelRuntime, voice_map: &VoiceMap) -> InfoData {
         })
         .collect();
 
-    InfoData::new().with_tts(tts)
+    let mut asr_models: Vec<(&str, &AsrHandle)> = runtime.asr_handles().collect();
+    asr_models.sort_by_key(|(name, _)| *name);
+
+    let asr = asr_models
+        .into_iter()
+        .filter(|(model_name, _)| {
+            let configured = asr_map.has_model(model_name);
+            if !configured {
+                tracing::warn!(
+                    model = %model_name,
+                    "ASR model in runtime but not in ASR model map config; excluding from describe response",
+                );
+            }
+            configured
+        })
+        .map(|(model_name, _handle)| {
+            serde_json::json!({
+                "name": model_name,
+                "models": [{
+                    "name": model_name,
+                    "languages": Vec::<String>::new(),
+                    "attribution": crane_attribution(),
+                    "installed": true,
+                }],
+                "attribution": crane_attribution(),
+                "installed": true,
+                "supports_transcript_streaming": streaming_enabled,
+            })
+        })
+        .collect();
+
+    InfoData::new().with_tts(tts).with_asr(asr)
 }
 
 /// Send an `error` event with an optional machine-readable code.
@@ -2039,6 +2078,109 @@ mod tests {
         match &results[0] {
             Event::Info(data) => {
                 assert_eq!(data.tts[0]["supports_synthesize_streaming"], false);
+            },
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_asr_streaming_is_true() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(&rt, &VoiceMap::new(&[], &rt), &am, vec![Event::Describe]).await;
+
+        match &results[0] {
+            Event::Info(data) => {
+                assert_eq!(data.asr[0]["supports_transcript_streaming"], true);
+            },
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_asr_streaming_disabled() {
+        let mut rt = test_runtime();
+        rt.set_streaming_enabled(false);
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(&rt, &VoiceMap::new(&[], &rt), &am, vec![Event::Describe]).await;
+
+        match &results[0] {
+            Event::Info(data) => {
+                assert_eq!(data.asr[0]["supports_transcript_streaming"], false);
+            },
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_single_asr_model() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(&rt, &vm, &am, vec![Event::Describe]).await;
+
+        match &results[0] {
+            Event::Info(data) => {
+                assert!(data.tts.is_empty());
+                assert_eq!(data.asr.len(), 1);
+                let program = &data.asr[0];
+                assert_eq!(program["name"], "m1");
+                assert_eq!(program["supports_transcript_streaming"], true);
+                let models = program["models"].as_array().unwrap();
+                assert_eq!(models.len(), 1);
+                assert_eq!(models[0]["name"], "m1");
+                assert_eq!(models[0]["languages"], serde_json::json!([]));
+            },
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_excludes_asr_model_not_in_asr_map() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "configured", "qwen3_asr", Box::new(MockAsr));
+        register_test_asr(&mut rt, "unconfigured", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["configured".to_string()], &rt);
+
+        let results = run_events(&rt, &vm, &am, vec![Event::Describe]).await;
+
+        match &results[0] {
+            Event::Info(data) => {
+                assert_eq!(data.asr.len(), 1);
+                assert_eq!(data.asr[0]["name"], "configured");
+            },
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_tts_and_asr_together() {
+        let mut rt = test_runtime();
+        register_test_tts(
+            &mut rt,
+            "t1",
+            "qwen3_tts",
+            Box::new(MockTts::new(24000, voices(&["alice"]))),
+        );
+        register_test_asr(&mut rt, "a1", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&["t1".to_string()], &rt);
+        let am = AsrModelMap::new(&["a1".to_string()], &rt);
+
+        let results = run_events(&rt, &vm, &am, vec![Event::Describe]).await;
+
+        match &results[0] {
+            Event::Info(data) => {
+                assert_eq!(data.tts.len(), 1);
+                assert_eq!(data.tts[0]["name"], "t1");
+                assert_eq!(data.asr.len(), 1);
+                assert_eq!(data.asr[0]["name"], "a1");
             },
             other => panic!("expected Info, got {other:?}"),
         }
