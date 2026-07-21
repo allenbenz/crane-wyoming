@@ -25,7 +25,8 @@ use tokio::sync::oneshot;
 
 use wyoming_protocol::event::{
     AudioChunkData, AudioFormat, AudioStartData, AudioStopData, ErrorData, Event, InfoData,
-    PingData, PongData, SynthesizeData, TranscribeData, TranscriptData,
+    PingData, PongData, SynthesizeData, TranscribeData, TranscriptChunkData, TranscriptData,
+    TranscriptStartData,
 };
 use wyoming_protocol::wire::{read_event, write_event};
 
@@ -289,11 +290,12 @@ fn resolve_asr_model<'m>(asr_map: &'m AsrModelMap, data: &TranscribeData) -> Asr
 const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// How long to wait for a single write to the client during streaming
-/// synthesis before giving up.
+/// synthesis or streaming transcription before giving up.
 ///
 /// The streaming path holds a model's dedicated worker thread hostage for
 /// as long as writes to the client take (see the backpressure docs on
-/// [`ModelRuntime::generate_speech_stream`]): the worker blocks in
+/// [`ModelRuntime::generate_speech_stream`] and
+/// [`ModelRuntime::transcribe_stream`]): the worker blocks in
 /// `blocking_send` once the bounded chunk channel fills, which happens as
 /// soon as this handler stops draining it. An unresponsive client (slow
 /// reader, congested link, or one that simply stopped reading) would
@@ -338,8 +340,9 @@ const MAX_TRANSCRIBE_AUDIO_BYTES: usize = 1024 * 1024;
 /// for [`handle_synthesize_streaming`]. The TTS thread checks for this
 /// before generation (and, for streaming, after each chunk) and stops
 /// instead of blocking or erroring. The same applies to a `transcribe`
-/// request in flight in [`handle_transcribe`]: the ASR thread checks its
-/// oneshot sender before transcribing.
+/// request in flight: the ASR thread checks its oneshot sender before
+/// transcribing in [`handle_transcribe_batch`], or its chunk sender after
+/// each chunk in [`handle_transcribe_streaming`].
 ///
 /// # Errors
 ///
@@ -425,8 +428,9 @@ fn audio_format(audio_info: AudioInfo) -> AudioFormat {
 
 /// Write an event to `writer`, giving up after [`WRITE_TIMEOUT`].
 ///
-/// Used on the streaming synthesis path, where a stalled write blocks the
-/// model's shared worker thread -- see [`WRITE_TIMEOUT`].
+/// Used on the streaming synthesis and streaming transcription paths, where
+/// a stalled write blocks the model's shared worker thread -- see
+/// [`WRITE_TIMEOUT`].
 async fn write_event_timeout<W>(writer: &mut W, event: &Event) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -465,6 +469,17 @@ where
     W: AsyncWrite + Unpin,
 {
     write_event_timeout(writer, &Event::AudioStop(AudioStopData::new())).await?;
+    send_error_timeout(writer, text, None).await
+}
+
+/// Close an in-progress transcript stream with `transcript-stop`, then
+/// report `text` as an `error` event -- mirrors [`stop_stream_with_error`]'s
+/// mid-stream error convention for the ASR streaming path.
+async fn stop_transcript_stream_with_error<W>(writer: &mut W, text: &str) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_event_timeout(writer, &Event::TranscriptStop).await?;
     send_error_timeout(writer, text, None).await
 }
 
@@ -846,16 +861,16 @@ where
 }
 
 /// Handle a `transcribe` event: collect the client's audio and reply with a
-/// `transcript`.
+/// transcript.
 ///
 /// Resolves the requested ASR model, then reads the following
 /// `audio-start`/`audio-chunk`*/`audio-stop` sequence via
 /// [`collect_transcribe_audio`] -- these are read directly here rather than
 /// by the caller's main event loop, since they belong to this one
-/// `transcribe` exchange.
-///
-/// Unlike [`handle_synthesize`], there is only one dispatch path (batch):
-/// streaming transcript delivery is a later addition.
+/// `transcribe` exchange. Dispatches to [`handle_transcribe_streaming`] or
+/// [`handle_transcribe_batch`] depending on [`ModelRuntime::streaming_enabled`],
+/// the same flag [`handle_synthesize`] uses for TTS -- see that method's doc
+/// for why streaming is conditional (in short: CPU hardware can't keep up).
 async fn handle_transcribe<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -896,12 +911,33 @@ where
     let Some(pcm_bytes) = collect_transcribe_audio(reader, writer, expected_rate).await? else {
         return Ok(());
     };
-
     let audio = pcm_i16_to_f32(&pcm_bytes);
+
+    if runtime.streaming_enabled() {
+        handle_transcribe_streaming(writer, runtime, model_name, audio, data.language).await
+    } else {
+        handle_transcribe_batch(writer, runtime, model_name, audio, data.language).await
+    }
+}
+
+/// Transcribe the complete audio and send back a single `transcript`.
+///
+/// Used when [`ModelRuntime::streaming_enabled`] is `false`. Dispatches
+/// through [`ModelRuntime::transcribe`] and waits for the one-shot result.
+async fn handle_transcribe_batch<W>(
+    writer: &mut W,
+    runtime: &ModelRuntime,
+    model_name: &str,
+    audio: Vec<f32>,
+    language: Option<String>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let (tx, rx) = oneshot::channel();
     let req = AsrTranscribeRequest {
         audio,
-        language: data.language,
+        language,
         response_tx: tx,
     };
 
@@ -929,6 +965,111 @@ where
     write_event(writer, &Event::Transcript(result)).await?;
 
     Ok(())
+}
+
+/// Transcribe the audio and deliver the transcript incrementally.
+///
+/// The audio has already been fully collected by the time this is called --
+/// only the *transcript* is delivered incrementally, via
+/// `transcript-start`/`transcript-chunk`*/`transcript`/`transcript-stop`.
+/// See [`ModelRuntime::transcribe_stream`]'s docs for why: Crane's `Asr`
+/// trait takes a complete audio slice, so "streaming" here only applies to
+/// the output.
+///
+/// `transcript-start` is delayed until the first chunk arrives, so a
+/// failure before any output surfaces as a plain `error` event with no
+/// `transcript-start`/`transcript-stop` wrapper. A stream that completes
+/// with no chunks at all is not an error -- it is reported as an empty
+/// `transcript-start`/`transcript`/`transcript-stop` sequence. A failure
+/// after the first chunk closes the in-progress stream with
+/// `transcript-stop` before sending the `error` event, via
+/// [`stop_transcript_stream_with_error`] -- crane-wyoming's own mid-stream
+/// error convention, mirroring [`stop_stream_with_error`] for TTS. Every
+/// write to the client uses [`WRITE_TIMEOUT`], for the same reason
+/// documented there: a stalled write here blocks the model's shared worker
+/// thread.
+///
+/// Unlike the TTS streaming loop, which stops on channel closure, this loop
+/// stops as soon as it sees a chunk with `is_final: true` and returns
+/// without waiting on `rx` again. This relies on `Asr::transcribe_stream`'s
+/// contract that the final chunk is the last one produced; a non-conformant
+/// implementation that kept sending after `is_final: true` would find its
+/// next `blocking_send` fail once this function has returned and dropped
+/// `rx`, which the worker thread logs as a caller disconnect rather than
+/// the model bug it would actually be.
+async fn handle_transcribe_streaming<W>(
+    writer: &mut W,
+    runtime: &ModelRuntime,
+    model_name: &str,
+    audio: Vec<f32>,
+    language: Option<String>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut rx = match runtime.transcribe_stream(model_name, audio, language) {
+        Ok(rx) => rx,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to dispatch ASR stream request");
+            return send_error_timeout(writer, &format!("ASR engine unavailable: {e}"), None).await;
+        },
+    };
+
+    let first = match rx.recv().await {
+        Some(Ok(transcript)) => transcript,
+        Some(Err(e)) => {
+            tracing::error!(error = %e, "ASR streaming failed");
+            return send_error_timeout(writer, &format!("ASR transcription failed: {e}"), None)
+                .await;
+        },
+        None => {
+            tracing::debug!("ASR stream produced no transcript chunks");
+            write_event_timeout(writer, &Event::TranscriptStart(TranscriptStartData::new()))
+                .await?;
+            write_event_timeout(writer, &Event::Transcript(TranscriptData::new(""))).await?;
+            return write_event_timeout(writer, &Event::TranscriptStop).await;
+        },
+    };
+
+    let start = match &first.language {
+        Some(language) => TranscriptStartData::new().with_language(language.clone()),
+        None => TranscriptStartData::new(),
+    };
+    write_event_timeout(writer, &Event::TranscriptStart(start)).await?;
+
+    let mut current = first;
+    loop {
+        if current.is_final {
+            let mut result = TranscriptData::new(current.text);
+            if let Some(language) = current.language {
+                result = result.with_language(language);
+            }
+            write_event_timeout(writer, &Event::Transcript(result)).await?;
+            return write_event_timeout(writer, &Event::TranscriptStop).await;
+        }
+        write_event_timeout(
+            writer,
+            &Event::TranscriptChunk(TranscriptChunkData::new(current.text)),
+        )
+        .await?;
+
+        current = match rx.recv().await {
+            Some(Ok(transcript)) => transcript,
+            Some(Err(e)) => {
+                tracing::error!(error = %e, "ASR streaming failed mid-stream");
+                return stop_transcript_stream_with_error(
+                    writer,
+                    &format!("ASR transcription failed: {e}"),
+                )
+                .await;
+            },
+            None => {
+                tracing::warn!("ASR stream ended without a final transcript");
+                write_event_timeout(writer, &Event::Transcript(TranscriptData::new(""))).await?;
+                return write_event_timeout(writer, &Event::TranscriptStop).await;
+            },
+        };
+    }
 }
 
 /// Answer a `ping` event with a `pong` echoing the same text.
@@ -2124,6 +2265,79 @@ mod tests {
         }
     }
 
+    /// An ASR model with true incremental decoding: `transcribe_stream`
+    /// yields one chunk per string in `chunks`, marking only the last as
+    /// final.
+    struct MockStreamingAsr {
+        chunks: Vec<&'static str>,
+    }
+
+    impl Asr for MockStreamingAsr {
+        fn input_sample_rate(&self) -> u32 {
+            16000
+        }
+
+        fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOptions) -> Result<Transcript> {
+            Ok(Transcript {
+                text: format!("heard {} samples", audio.len()),
+                language: opts.language.clone(),
+                is_final: true,
+            })
+        }
+
+        fn transcribe_stream(
+            &mut self,
+            _audio: &[f32],
+            opts: &TranscribeOptions,
+        ) -> Result<crane::audio::AsrStream<'_>> {
+            let last = self.chunks.len().saturating_sub(1);
+            let language = opts.language.clone();
+            let chunks: Vec<Result<Transcript>> = self
+                .chunks
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    Ok(Transcript {
+                        text: (*text).to_string(),
+                        language: if i == last { language.clone() } else { None },
+                        is_final: i == last,
+                    })
+                })
+                .collect();
+            Ok(crane::audio::AsrStream::new(chunks.into_iter()))
+        }
+    }
+
+    /// An ASR model whose streaming transcription fails after producing one
+    /// partial chunk, used to test the mid-stream error convention.
+    struct MidStreamFailingAsr;
+
+    impl Asr for MidStreamFailingAsr {
+        fn input_sample_rate(&self) -> u32 {
+            16000
+        }
+
+        fn transcribe(&mut self, _audio: &[f32], _opts: &TranscribeOptions) -> Result<Transcript> {
+            anyhow::bail!("mock transcription failure")
+        }
+
+        fn transcribe_stream(
+            &mut self,
+            _audio: &[f32],
+            _opts: &TranscribeOptions,
+        ) -> Result<crane::audio::AsrStream<'_>> {
+            let chunks: Vec<Result<Transcript>> = vec![
+                Ok(Transcript {
+                    text: "partial".to_string(),
+                    language: None,
+                    is_final: false,
+                }),
+                Err(anyhow::anyhow!("mock mid-stream failure")),
+            ];
+            Ok(crane::audio::AsrStream::new(chunks.into_iter()))
+        }
+    }
+
     /// Registers `asr` on `Device::Cpu` -- the device is irrelevant to these
     /// tests since `with_context` is a cheap no-op wrapper on CPU either way.
     fn register_test_asr(
@@ -2197,7 +2411,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_transcribe_default_model() {
+        // Batch mode: streaming disabled, so a single `transcript` is
+        // expected with no transcript-start/stop wrapper.
         let mut rt = test_runtime();
+        rt.set_streaming_enabled(false);
         register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
         let vm = VoiceMap::new(&[], &rt);
         let am = AsrModelMap::new(&["m1".to_string()], &rt);
@@ -2227,6 +2444,7 @@ mod tests {
     #[tokio::test]
     async fn test_transcribe_named_model() {
         let mut rt = test_runtime();
+        rt.set_streaming_enabled(false);
         register_test_asr(&mut rt, "a", "qwen3_asr", Box::new(MockAsr));
         register_test_asr(&mut rt, "b", "qwen3_asr", Box::new(MockAsr));
         let vm = VoiceMap::new(&[], &rt);
@@ -2257,6 +2475,7 @@ mod tests {
     #[tokio::test]
     async fn test_transcribe_language_hint_forwarded() {
         let mut rt = test_runtime();
+        rt.set_streaming_enabled(false);
         register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
         let vm = VoiceMap::new(&[], &rt);
         let am = AsrModelMap::new(&["m1".to_string()], &rt);
@@ -2455,6 +2674,7 @@ mod tests {
     #[tokio::test]
     async fn test_transcribe_multi_chunk() {
         let mut rt = test_runtime();
+        rt.set_streaming_enabled(false);
         register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
         let vm = VoiceMap::new(&[], &rt);
         let am = AsrModelMap::new(&["m1".to_string()], &rt);
@@ -2570,6 +2790,241 @@ mod tests {
             Event::Error(data) => assert!(data.text.contains("mock transcription failure")),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_streaming_multi_chunk() {
+        // Streaming enabled (the test_runtime default): a model with true
+        // incremental decoding delivers transcript-start, one
+        // transcript-chunk per partial result, a final transcript, then
+        // transcript-stop.
+        let mut rt = test_runtime();
+        register_test_asr(
+            &mut rt,
+            "m1",
+            "qwen3_asr",
+            Box::new(MockStreamingAsr {
+                chunks: vec!["one", "one two", "one two three"],
+            }),
+        );
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 4]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            results,
+            vec![
+                Event::TranscriptStart(TranscriptStartData::new()),
+                Event::TranscriptChunk(TranscriptChunkData::new("one")),
+                Event::TranscriptChunk(TranscriptChunkData::new("one two")),
+                Event::Transcript(TranscriptData::new("one two three")),
+                Event::TranscriptStop,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_streaming_single_chunk_default_impl() {
+        // MockAsr does not override transcribe_stream, so the default impl
+        // wraps transcribe() in a single final chunk: transcript-start,
+        // transcript (no transcript-chunk), transcript-stop.
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 4]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            results,
+            vec![
+                Event::TranscriptStart(TranscriptStartData::new()),
+                Event::Transcript(TranscriptData::new("heard 4 samples")),
+                Event::TranscriptStop,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_streaming_language_forwarded() {
+        let mut rt = test_runtime();
+        register_test_asr(
+            &mut rt,
+            "m1",
+            "qwen3_asr",
+            Box::new(MockStreamingAsr {
+                chunks: vec!["hallo"],
+            }),
+        );
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new().with_language("de")),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 1]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            results,
+            vec![
+                Event::TranscriptStart(TranscriptStartData::new().with_language("de")),
+                Event::Transcript(TranscriptData::new("hallo").with_language("de")),
+                Event::TranscriptStop,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_streaming_failure_before_start() {
+        // A failure while setting up the stream (transcribe_stream itself
+        // errors) surfaces as a plain error -- no transcript-start has been
+        // sent yet.
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(FailingAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 4]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Event::Error(data) => assert!(data.text.contains("mock transcription failure")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_streaming_mid_stream_failure_sends_stop_then_error() {
+        // A failure after the first (partial) chunk closes the stream with
+        // transcript-stop before reporting the error, per crane-wyoming's
+        // mid-stream error convention.
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MidStreamFailingAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 4]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 4);
+        assert_eq!(
+            results[0],
+            Event::TranscriptStart(TranscriptStartData::new())
+        );
+        assert_eq!(
+            results[1],
+            Event::TranscriptChunk(TranscriptChunkData::new("partial"))
+        );
+        assert_eq!(results[2], Event::TranscriptStop);
+        match &results[3] {
+            Event::Error(data) => assert!(data.text.contains("mock mid-stream failure")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_streaming_empty_stream() {
+        let mut rt = test_runtime();
+        register_test_asr(
+            &mut rt,
+            "m1",
+            "qwen3_asr",
+            Box::new(MockStreamingAsr { chunks: vec![] }),
+        );
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 4]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            results,
+            vec![
+                Event::TranscriptStart(TranscriptStartData::new()),
+                Event::Transcript(TranscriptData::new("")),
+                Event::TranscriptStop,
+            ]
+        );
     }
 
     #[tokio::test]

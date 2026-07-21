@@ -192,13 +192,54 @@ pub struct AsrTranscribeRequest {
     pub response_tx: oneshot::Sender<Result<Transcript>>,
 }
 
+/// A request to transcribe audio incrementally, sent to an ASR model's
+/// dedicated thread.
+///
+/// Unlike [`AsrTranscribeRequest`], the response is delivered as a series of
+/// [`Transcript`] chunks over `chunk_tx` rather than a single result -- one
+/// send per chunk yielded by [`Asr::transcribe_stream`], followed by the
+/// sender being dropped to signal completion. An `Err` chunk ends the
+/// stream immediately.
+///
+/// # Backpressure
+///
+/// `chunk_tx` is bounded, and the model's worker thread sends on it with a
+/// blocking call. A consumer that stops draining the matching receiver
+/// without dropping it will stall the worker thread indefinitely -- which
+/// also blocks every other request (streaming or batch) queued for the same
+/// model, since they share one thread. Callers must keep draining or drop
+/// the receiver promptly.
+pub(crate) struct AsrStreamRequest {
+    /// Mono f32 PCM audio at the model's expected sample rate.
+    pub(crate) audio: Vec<f32>,
+    /// Language hint (e.g. "en", "zh"), or `None` to let the model
+    /// auto-detect.
+    pub(crate) language: Option<String>,
+    /// Channel to send transcript chunks back as they're produced.
+    pub(crate) chunk_tx: mpsc::Sender<Result<Transcript>>,
+}
+
+/// A request queued on an ASR model's dedicated thread: either a batch
+/// [`AsrTranscribeRequest`] or an incremental [`AsrStreamRequest`].
+///
+/// Both variants share one channel/thread so streaming and non-streaming
+/// requests for the same model are processed in a single FIFO queue,
+/// matching the "one request at a time" concurrency model documented on
+/// [`AsrHandle`].
+enum AsrRequest {
+    /// Transcribe the complete audio and return a single result.
+    Transcribe(AsrTranscribeRequest),
+    /// Transcribe the audio incrementally, streaming transcript chunks.
+    Stream(AsrStreamRequest),
+}
+
 /// Handle to an ASR model running on its dedicated thread.
 ///
 /// The input sample rate is queried once at load time, before the model is
 /// moved to its thread, so it can be read without blocking on the
 /// transcription queue.
 pub struct AsrHandle {
-    tx: mpsc::UnboundedSender<AsrTranscribeRequest>,
+    tx: mpsc::UnboundedSender<AsrRequest>,
     input_sample_rate: u32,
     model_type_name: &'static str,
     pending_count: Arc<AtomicU64>,
@@ -230,7 +271,20 @@ impl AsrHandle {
     /// Returns an error if the model's thread has stopped.
     pub fn send(&self, req: AsrTranscribeRequest) -> Result<()> {
         self.pending_count.fetch_add(1, Ordering::Relaxed);
-        self.tx.send(req).map_err(|_| {
+        self.tx.send(AsrRequest::Transcribe(req)).map_err(|_| {
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            anyhow::anyhow!("ASR thread has stopped")
+        })
+    }
+
+    /// Send a streaming transcription request to the model's thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model's thread has stopped.
+    fn send_stream(&self, req: AsrStreamRequest) -> Result<()> {
+        self.pending_count.fetch_add(1, Ordering::Relaxed);
+        self.tx.send(AsrRequest::Stream(req)).map_err(|_| {
             self.pending_count.fetch_sub(1, Ordering::Relaxed);
             anyhow::anyhow!("ASR thread has stopped")
         })
@@ -554,7 +608,7 @@ impl ModelRuntime {
         let input_sample_rate = asr.input_sample_rate();
         let pending_count = Arc::new(AtomicU64::new(0));
 
-        let (tx, rx) = mpsc::unbounded_channel::<AsrTranscribeRequest>();
+        let (tx, rx) = mpsc::unbounded_channel::<AsrRequest>();
 
         let thread_name = format!("asr-{name}");
         let log_name = name.clone();
@@ -654,6 +708,37 @@ impl ModelRuntime {
             .asr_handle(model_name)
             .ok_or_else(|| anyhow::anyhow!("unknown ASR model: {model_name}"))?;
         handle.send(req)
+    }
+
+    /// Dispatch a streaming transcription request to the named ASR model.
+    ///
+    /// The returned receiver is bounded and the model's worker thread sends
+    /// on it with a blocking call -- see [`AsrStreamRequest`]'s backpressure
+    /// docs. Keep draining it (or drop it) promptly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `model_name` is not registered or the model's
+    /// thread has stopped.
+    pub fn transcribe_stream(
+        &self,
+        model_name: &str,
+        audio: Vec<f32>,
+        language: Option<String>,
+    ) -> Result<mpsc::Receiver<Result<Transcript>>> {
+        let handle = self
+            .asr_handle(model_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown ASR model: {model_name}"))?;
+
+        // Capacity 2: lets the worker produce one chunk ahead of what the
+        // consumer is processing, matching generate_speech_stream.
+        let (chunk_tx, chunk_rx) = mpsc::channel(2);
+        handle.send_stream(AsrStreamRequest {
+            audio,
+            language,
+            chunk_tx,
+        })?;
+        Ok(chunk_rx)
     }
 }
 
@@ -825,7 +910,7 @@ fn handle_stream_request(tts: &mut dyn Tts, req: &TtsStreamRequest, model_name: 
 /// See [`run_tts_thread`] for why each request runs inside `device`'s
 /// [`with_context`](candle_core::Device::with_context).
 fn run_asr_thread(
-    mut rx: mpsc::UnboundedReceiver<AsrTranscribeRequest>,
+    mut rx: mpsc::UnboundedReceiver<AsrRequest>,
     mut asr: Box<dyn Asr + Send>,
     model_name: &str,
     pending_count: &AtomicU64,
@@ -833,7 +918,10 @@ fn run_asr_thread(
 ) {
     tracing::info!(model = %model_name, "ASR thread started");
     while let Some(req) = rx.blocking_recv() {
-        device.with_context(|| handle_transcribe_request(&mut *asr, req, model_name));
+        device.with_context(|| match req {
+            AsrRequest::Transcribe(req) => handle_transcribe_request(&mut *asr, req, model_name),
+            AsrRequest::Stream(req) => handle_stream_transcribe_request(&mut *asr, req, model_name),
+        });
         pending_count.fetch_sub(1, Ordering::Relaxed);
     }
     tracing::info!(model = %model_name, "ASR thread stopped (channel closed)");
@@ -884,6 +972,63 @@ fn handle_transcribe_request(asr: &mut dyn Asr, req: AsrTranscribeRequest, model
     }
 
     let _ = req.response_tx.send(result);
+}
+
+/// Handle one streaming transcription request: transcribe the audio
+/// incrementally, sending each chunk over `req.chunk_tx` as it's produced.
+///
+/// Stops early (without treating it as an error) if the receiver is
+/// dropped, i.e. the caller disconnected mid-stream.
+fn handle_stream_transcribe_request(asr: &mut dyn Asr, req: AsrStreamRequest, model_name: &str) {
+    let sample_count = req.audio.len();
+
+    if req.chunk_tx.is_closed() {
+        tracing::warn!(model = %model_name, sample_count, "Caller disconnected, skipping");
+        return;
+    }
+
+    let t0 = std::time::Instant::now();
+    let mut chunk_count = 0usize;
+    let opts = TranscribeOptions {
+        language: req.language,
+        ..TranscribeOptions::default()
+    };
+
+    // `Ok(true)` means the caller disconnected mid-stream (not an error);
+    // `Ok(false)` means the stream ran to completion.
+    let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<bool> {
+        let mut stream = asr.transcribe_stream(&req.audio, &opts)?;
+        while let Some(transcript) = stream.next_chunk()? {
+            chunk_count += 1;
+            if req.chunk_tx.blocking_send(Ok(transcript)).is_err() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }));
+
+    let result = match panic_result {
+        Ok(result) => result,
+        Err(panic_payload) => {
+            let msg = panic_message(&*panic_payload);
+            tracing::error!(model = %model_name, sample_count, panic = %msg, "ASR streaming panicked");
+            Err(anyhow::anyhow!("ASR transcription panicked: {msg}"))
+        },
+    };
+
+    let elapsed_ms = t0.elapsed().as_millis();
+    match result {
+        Ok(true) => {
+            tracing::warn!(model = %model_name, sample_count, chunk_count, elapsed_ms, "Caller disconnected mid-stream");
+        },
+        Ok(false) => {
+            tracing::info!(model = %model_name, sample_count, chunk_count, elapsed_ms, "ASR streaming complete");
+        },
+        Err(e) => {
+            tracing::error!(model = %model_name, sample_count, chunk_count, elapsed_ms, error = %e, "ASR streaming failed");
+            let _ = req.chunk_tx.blocking_send(Err(e));
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1809,7 +1954,7 @@ mod tests {
 
     #[test]
     fn test_send_after_asr_thread_stopped() {
-        let (tx, rx) = mpsc::unbounded_channel::<AsrTranscribeRequest>();
+        let (tx, rx) = mpsc::unbounded_channel::<AsrRequest>();
         drop(rx);
 
         let handle = AsrHandle {
@@ -1928,5 +2073,239 @@ mod tests {
         let result2 = rx2.blocking_recv().unwrap();
         assert!(result2.is_ok());
         assert_eq!(result2.unwrap().text, "ok 2 samples");
+    }
+
+    struct StreamingMockAsr {
+        chunks: Vec<&'static str>,
+    }
+
+    impl StreamingMockAsr {
+        fn new(chunks: Vec<&'static str>) -> Self {
+            Self { chunks }
+        }
+    }
+
+    impl Asr for StreamingMockAsr {
+        fn input_sample_rate(&self) -> u32 {
+            16000
+        }
+
+        fn transcribe(&mut self, audio: &[f32], _opts: &TranscribeOptions) -> Result<Transcript> {
+            Ok(Transcript {
+                text: format!("heard {} samples", audio.len()),
+                language: None,
+                is_final: true,
+            })
+        }
+
+        fn transcribe_stream(
+            &mut self,
+            _audio: &[f32],
+            _opts: &TranscribeOptions,
+        ) -> Result<crane::audio::AsrStream<'_>> {
+            let last = self.chunks.len().saturating_sub(1);
+            let chunks: Vec<Result<Transcript>> = self
+                .chunks
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    Ok(Transcript {
+                        text: (*text).to_string(),
+                        language: None,
+                        is_final: i == last,
+                    })
+                })
+                .collect();
+            Ok(crane::audio::AsrStream::new(chunks.into_iter()))
+        }
+    }
+
+    #[test]
+    fn test_transcribe_stream_multiple_chunks() {
+        let mut rt = ModelRuntime::new();
+        register_test_asr(
+            &mut rt,
+            "m1",
+            "qwen3_asr",
+            Box::new(StreamingMockAsr::new(vec![
+                "one",
+                "one two",
+                "one two three",
+            ])),
+        );
+
+        let mut rx = rt.transcribe_stream("m1", vec![0.0f32; 4], None).unwrap();
+
+        let mut received = Vec::new();
+        while let Some(result) = rx.blocking_recv() {
+            received.push(result.unwrap().text);
+        }
+        assert_eq!(received, vec!["one", "one two", "one two three"]);
+    }
+
+    #[test]
+    fn test_transcribe_stream_single_chunk_default_impl() {
+        // MockAsr does not override transcribe_stream, so the default
+        // impl wraps transcribe() in a single-item stream.
+        let mut rt = ModelRuntime::new();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr::new()));
+
+        let mut rx = rt.transcribe_stream("m1", vec![0.0f32; 4], None).unwrap();
+
+        let first = rx.blocking_recv().unwrap().unwrap();
+        assert_eq!(first.text, "heard 4 samples");
+        assert!(first.is_final);
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn test_transcribe_stream_unknown_model() {
+        let rt = ModelRuntime::new();
+        let result = rt.transcribe_stream("nonexistent", vec![0.0f32; 2], None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_transcribe_stream_empty() {
+        let mut rt = ModelRuntime::new();
+        register_test_asr(
+            &mut rt,
+            "m1",
+            "qwen3_asr",
+            Box::new(StreamingMockAsr::new(vec![])),
+        );
+
+        let mut rx = rt.transcribe_stream("m1", vec![0.0f32; 4], None).unwrap();
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn test_transcribe_stream_receiver_dropped() {
+        let mut rt = ModelRuntime::new();
+        register_test_asr(
+            &mut rt,
+            "m1",
+            "qwen3_asr",
+            Box::new(StreamingMockAsr::new(vec!["one", "two", "three"])),
+        );
+
+        let mut rx = rt.transcribe_stream("m1", vec![0.0f32; 4], None).unwrap();
+        rx.blocking_recv().unwrap().unwrap();
+        drop(rx);
+
+        // The worker thread must notice the dropped receiver and move on --
+        // this batch request would hang forever if it didn't.
+        let (tx, rx2) = oneshot::channel();
+        rt.transcribe(
+            "m1",
+            AsrTranscribeRequest {
+                audio: vec![0.0f32; 2],
+                language: None,
+                response_tx: tx,
+            },
+        )
+        .unwrap();
+
+        assert!(rx2.blocking_recv().unwrap().is_ok());
+    }
+
+    /// A transcript iterator that yields one partial chunk, then panics on
+    /// the next pull -- mirrors [`PanicOnSecondChunk`] for TTS streaming.
+    struct PanicOnSecondTranscriptChunk {
+        index: usize,
+    }
+
+    impl Iterator for PanicOnSecondTranscriptChunk {
+        type Item = Result<Transcript>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.index += 1;
+            match self.index {
+                1 => Some(Ok(Transcript {
+                    text: "partial".to_string(),
+                    language: None,
+                    is_final: false,
+                })),
+                2 => panic!("simulated stream panic"),
+                _ => None,
+            }
+        }
+    }
+
+    struct StreamPanickingAsr {
+        call_count: u32,
+    }
+
+    impl StreamPanickingAsr {
+        fn new() -> Self {
+            Self { call_count: 0 }
+        }
+    }
+
+    impl Asr for StreamPanickingAsr {
+        fn input_sample_rate(&self) -> u32 {
+            16000
+        }
+
+        fn transcribe(&mut self, audio: &[f32], _opts: &TranscribeOptions) -> Result<Transcript> {
+            Ok(Transcript {
+                text: format!("ok {} samples", audio.len()),
+                language: None,
+                is_final: true,
+            })
+        }
+
+        fn transcribe_stream(
+            &mut self,
+            _audio: &[f32],
+            _opts: &TranscribeOptions,
+        ) -> Result<crane::audio::AsrStream<'_>> {
+            self.call_count += 1;
+            if self.call_count == 1 {
+                Ok(crane::audio::AsrStream::new(PanicOnSecondTranscriptChunk {
+                    index: 0,
+                }))
+            } else {
+                let chunks: Vec<Result<Transcript>> = vec![Ok(Transcript {
+                    text: "ok".to_string(),
+                    language: None,
+                    is_final: true,
+                })];
+                Ok(crane::audio::AsrStream::new(chunks.into_iter()))
+            }
+        }
+    }
+
+    #[test]
+    fn test_transcribe_stream_panic_recovery() {
+        let mut rt = ModelRuntime::new();
+        register_test_asr(
+            &mut rt,
+            "panic_stream",
+            "qwen3_asr",
+            Box::new(StreamPanickingAsr::new()),
+        );
+
+        let mut rx = rt
+            .transcribe_stream("panic_stream", vec![0.0f32; 4], None)
+            .unwrap();
+
+        let first = rx.blocking_recv().unwrap();
+        assert!(first.is_ok());
+
+        let second = rx.blocking_recv().unwrap();
+        assert!(second.is_err());
+        assert!(second.unwrap_err().to_string().contains("panicked"));
+
+        assert!(rx.blocking_recv().is_none());
+
+        // The thread must have recovered: the next stream request succeeds.
+        let mut rx2 = rt
+            .transcribe_stream("panic_stream", vec![0.0f32; 4], None)
+            .unwrap();
+        let result = rx2.blocking_recv().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().text, "ok");
+        assert!(rx2.blocking_recv().is_none());
     }
 }
