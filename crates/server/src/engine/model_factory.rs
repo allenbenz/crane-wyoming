@@ -288,22 +288,25 @@ pub fn discover_asr_models(parent_dir: &Path) -> Result<Vec<DiscoveredModel>> {
     Ok(models)
 }
 
-/// Resolve the `--model-tts` names an operator requested against the models
-/// [`discover_models`] found under `<model-path>/tts`.
+/// Shared implementation behind [`resolve_models_to_load`] and
+/// [`resolve_asr_models_to_load`]: resolve `requested` names against
+/// `discovered` models, reporting errors against `flag_name` (e.g.
+/// `--model-tts`).
 ///
 /// If `requested` is empty, every model in `discovered` is returned (in its
 /// existing, alphabetical order). Otherwise, exactly the named models are
 /// returned, in `requested`'s order -- so the first name given becomes the
-/// default voice.
+/// default.
 ///
 /// # Errors
 ///
 /// Returns an error if a requested name doesn't match any discovered model,
 /// or if the same name is requested more than once (which would otherwise
 /// load and register the same model twice under one name).
-pub fn resolve_models_to_load<'a>(
+fn resolve_requested_models<'a>(
     discovered: &'a [DiscoveredModel],
     requested: &[String],
+    flag_name: &str,
 ) -> Result<Vec<&'a DiscoveredModel>> {
     if requested.is_empty() {
         return Ok(discovered.iter().collect());
@@ -313,7 +316,7 @@ pub fn resolve_models_to_load<'a>(
     let mut resolved = Vec::with_capacity(requested.len());
     for name in requested {
         if !seen.insert(name.as_str()) {
-            anyhow::bail!("model '{name}' specified more than once in --model-tts");
+            anyhow::bail!("model '{name}' specified more than once in {flag_name}");
         }
         let model = discovered.iter().find(|m| &m.name == name).ok_or_else(|| {
             let available: Vec<&str> = discovered.iter().map(|m| m.name.as_str()).collect();
@@ -325,6 +328,35 @@ pub fn resolve_models_to_load<'a>(
         resolved.push(model);
     }
     Ok(resolved)
+}
+
+/// Resolve the `--model-tts` names an operator requested against the models
+/// [`discover_models`] found under `<model-path>/tts`. The first name given
+/// becomes the default voice; see [`resolve_requested_models`] for details.
+///
+/// # Errors
+///
+/// See [`resolve_requested_models`].
+pub fn resolve_models_to_load<'a>(
+    discovered: &'a [DiscoveredModel],
+    requested: &[String],
+) -> Result<Vec<&'a DiscoveredModel>> {
+    resolve_requested_models(discovered, requested, "--model-tts")
+}
+
+/// Resolve the `--model-asr` names an operator requested against the models
+/// [`discover_asr_models`] found under `<model-path>/asr`. The first name
+/// given becomes the default ASR model; see [`resolve_requested_models`] for
+/// details.
+///
+/// # Errors
+///
+/// See [`resolve_requested_models`].
+pub fn resolve_asr_models_to_load<'a>(
+    discovered: &'a [DiscoveredModel],
+    requested: &[String],
+) -> Result<Vec<&'a DiscoveredModel>> {
+    resolve_requested_models(discovered, requested, "--model-asr")
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1007,5 +1039,35 @@ mod tests {
         let requested = vec!["alpha".to_string(), "alpha".to_string()];
         let err = resolve_models_to_load(&discovered, &requested).unwrap_err();
         assert!(err.to_string().contains("more than once"));
+    }
+
+    // ── resolve_asr_models_to_load ──
+    //
+    // `resolve_models_to_load`'s tests above exercise the shared
+    // `resolve_requested_models` logic; these just confirm the ASR wrapper
+    // passes through its own `--model-asr` flag name in error messages.
+
+    fn discovered_asr_fixture() -> Vec<DiscoveredModel> {
+        vec![DiscoveredModel {
+            path: PathBuf::from("/models/alpha-asr"),
+            name: "alpha-asr".to_string(),
+            model_type: ModelType::Qwen3ASR,
+        }]
+    }
+
+    #[test]
+    fn resolve_asr_models_to_load_empty_requested_returns_all() {
+        let discovered = discovered_asr_fixture();
+        let resolved = resolve_asr_models_to_load(&discovered, &[]).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "alpha-asr");
+    }
+
+    #[test]
+    fn resolve_asr_models_to_load_duplicate_name_errors_mentions_model_asr_flag() {
+        let discovered = discovered_asr_fixture();
+        let requested = vec!["alpha-asr".to_string(), "alpha-asr".to_string()];
+        let err = resolve_asr_models_to_load(&discovered, &requested).unwrap_err();
+        assert!(err.to_string().contains("more than once in --model-asr"));
     }
 }

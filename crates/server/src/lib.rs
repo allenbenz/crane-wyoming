@@ -64,6 +64,18 @@ pub struct Args {
     )]
     pub model_tts: Vec<String>,
 
+    /// Load only the named model subdirectories from `<model-path>/asr`
+    /// (directory name, not full path). Repeatable, or separate multiple
+    /// names with `;`; order determines default-model priority (first =
+    /// default). When omitted, all recognized ASR models are loaded
+    /// alphabetically.
+    #[arg(
+        long = "model-asr",
+        env = "CRANE_WYOMING_MODEL_ASR",
+        value_delimiter = ';'
+    )]
+    pub model_asr: Vec<String>,
+
     /// List the models recognized under `--model-path` and exit, without
     /// starting the server.
     #[arg(long = "list-models")]
@@ -505,48 +517,16 @@ fn print_model_group(header: &str, models: &[DiscoveredModel]) {
     }
 }
 
-/// Run the Wyoming protocol TTS/ASR server.
-///
-/// Discovers TTS models under `<model-path>/tts` (optionally restricted by
-/// `--model-tts`). If `--list-models` is set, prints the discovered models
-/// and returns without starting the server. Otherwise loads them into a
-/// shared [`ModelRuntime`], optionally enables the on-disk TTS cache, then
-/// accepts connections on the address resolved from `--uri` (or
-/// `args.host`:`args.port` if unset) -- either TCP or a Unix domain socket.
-/// Each connection is handled on its own tokio task via
-/// [`handle_connection`]; TTS requests from all connections queue on the
-/// target model's dedicated thread and are processed one at a time.
+/// Resolve the compute device and floating-point dtype to load models with,
+/// from `--cpu` and (on CUDA builds) auto-detected GPU availability.
 ///
 /// # Errors
 ///
-/// Returns an error if `--model-path` doesn't exist or isn't a directory,
-/// no supported TTS models are found under `<model-path>/tts`, a named
-/// `--model-tts` doesn't match a discovered model or is repeated, a model
-/// fails to load, or the listener cannot bind.
-pub async fn run(args: Args) -> Result<()> {
-    if args.list_models {
-        print_discovered_models(&args.model_path)?;
-        return Ok(());
-    }
-
-    match std::fs::metadata(&args.model_path) {
-        Ok(meta) if meta.is_dir() => {},
-        Ok(_) => anyhow::bail!(
-            "model path '{}' is not a directory",
-            args.model_path.display()
-        ),
-        Err(e) => {
-            return Err(e).with_context(|| format!("model path '{}'", args.model_path.display()));
-        },
-    }
-
-    let tts_dir = args.model_path.join(TTS_SUBDIR);
-    let discovered = discover_or_empty(&tts_dir, engine::model_factory::discover_models)?;
-
-    if discovered.is_empty() {
-        anyhow::bail!("no supported TTS models found in '{}'", tts_dir.display());
-    }
-
+/// Returns an error if CUDA device initialization fails (CUDA builds only).
+#[cfg_attr(not(feature = "cuda"), allow(clippy::unnecessary_wraps))]
+fn resolve_device_and_dtype(
+    args: &Args,
+) -> Result<(crane_core::models::Device, crane_core::models::DType)> {
     let device = if args.cpu {
         crane_core::models::Device::Cpu
     } else {
@@ -576,6 +556,61 @@ pub async fn run(args: Args) -> Result<()> {
     #[cfg(not(feature = "cuda"))]
     let dtype = crane_core::models::DType::F32;
 
+    Ok((device, dtype))
+}
+
+/// Run the Wyoming protocol TTS/ASR server.
+///
+/// Discovers TTS models under `<model-path>/tts` (optionally restricted by
+/// `--model-tts`) and ASR models under `<model-path>/asr` (optionally
+/// restricted by `--model-asr`). If `--list-models` is set, prints the
+/// discovered models and returns without starting the server. Otherwise
+/// loads them into a shared [`ModelRuntime`], optionally enables the
+/// on-disk TTS cache, then accepts connections on the address resolved
+/// from `--uri` (or `args.host`:`args.port` if unset) -- either TCP or a
+/// Unix domain socket. Each connection is handled on its own tokio task
+/// via [`handle_connection`]; TTS/ASR requests from all connections queue
+/// on the target model's dedicated thread and are processed one at a time.
+///
+/// # Errors
+///
+/// Returns an error if `--model-path` doesn't exist or isn't a directory,
+/// no supported TTS or ASR models are found under `<model-path>/tts` or
+/// `<model-path>/asr`, a named `--model-tts`/`--model-asr` doesn't match a
+/// discovered model or is repeated, a model fails to load, or the listener
+/// cannot bind.
+pub async fn run(args: Args) -> Result<()> {
+    if args.list_models {
+        print_discovered_models(&args.model_path)?;
+        return Ok(());
+    }
+
+    match std::fs::metadata(&args.model_path) {
+        Ok(meta) if meta.is_dir() => {},
+        Ok(_) => anyhow::bail!(
+            "model path '{}' is not a directory",
+            args.model_path.display()
+        ),
+        Err(e) => {
+            return Err(e).with_context(|| format!("model path '{}'", args.model_path.display()));
+        },
+    }
+
+    let tts_dir = args.model_path.join(TTS_SUBDIR);
+    let tts_discovered = discover_or_empty(&tts_dir, engine::model_factory::discover_models)?;
+
+    let asr_dir = args.model_path.join(ASR_SUBDIR);
+    let asr_discovered = discover_or_empty(&asr_dir, engine::model_factory::discover_asr_models)?;
+
+    if tts_discovered.is_empty() && asr_discovered.is_empty() {
+        anyhow::bail!(
+            "no supported TTS or ASR models found in '{}'",
+            args.model_path.display()
+        );
+    }
+
+    let (device, dtype) = resolve_device_and_dtype(&args)?;
+
     // Incremental streaming is only worth it on a GPU: both CUDA and Metal
     // have far more memory bandwidth than CPU DDR, which is what
     // autoregressive TTS generation is bottlenecked on. On CPU, chunks
@@ -591,8 +626,13 @@ pub async fn run(args: Args) -> Result<()> {
     // so the first one named becomes the default); otherwise load
     // everything discovered, in alphabetical order.
     let models_to_load: Vec<&DiscoveredModel> =
-        engine::model_factory::resolve_models_to_load(&discovered, &args.model_tts)
+        engine::model_factory::resolve_models_to_load(&tts_discovered, &args.model_tts)
             .with_context(|| format!("in '{}'", tts_dir.display()))?;
+
+    // Same resolution, for ASR models under `<model-path>/asr`.
+    let asr_models_to_load: Vec<&DiscoveredModel> =
+        engine::model_factory::resolve_asr_models_to_load(&asr_discovered, &args.model_asr)
+            .with_context(|| format!("in '{}'", asr_dir.display()))?;
 
     // Resolved before model loading so `systemd_listen_fd`'s env-var cleanup
     // (see its doc comment) runs while this process is still single-threaded,
@@ -626,10 +666,16 @@ pub async fn run(args: Args) -> Result<()> {
         model_names.push(name);
     }
 
+    let mut asr_model_names = Vec::with_capacity(asr_models_to_load.len());
+    for model in &asr_models_to_load {
+        let path_str = model.path.to_string_lossy();
+        let name = runtime.load_asr(&path_str, &device, &dtype)?;
+        info!(name = %name, path = %path_str, "ASR model loaded");
+        asr_model_names.push(name);
+    }
+
     let voice_map = VoiceMap::new(&model_names, &runtime);
-    // No ASR models are loaded yet -- `--model-asr` is a later addition --
-    // so this always resolves to an empty map (no ASR models, no default).
-    let asr_map = AsrModelMap::new(&[], &runtime);
+    let asr_map = AsrModelMap::new(&asr_model_names, &runtime);
     let runtime = Arc::new(runtime);
     let voice_map = Arc::new(voice_map);
     let asr_map = Arc::new(asr_map);
@@ -637,7 +683,8 @@ pub async fn run(args: Args) -> Result<()> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
         listen = %listener.display_addr(),
-        models = model_names.len(),
+        tts_models = model_names.len(),
+        asr_models = asr_model_names.len(),
         "crane-wyoming ready"
     );
 
@@ -1124,6 +1171,7 @@ mod tests {
         Args {
             model_path: PathBuf::from("/nonexistent"),
             model_tts: vec![],
+            model_asr: vec![],
             list_models: false,
             port: 10200,
             host: "0.0.0.0".into(),
@@ -1149,14 +1197,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_bails_when_tts_subdir_missing() {
+    async fn run_bails_when_no_models_found() {
         let dir = tempfile::tempdir().unwrap();
         let args = Args {
             model_path: dir.path().to_path_buf(),
             ..args_with_uri("tcp://127.0.0.1:0")
         };
         let err = run(args).await.unwrap_err();
-        assert!(err.to_string().contains("tts"));
+        assert!(err.to_string().contains("no supported TTS or ASR models"));
+    }
+
+    #[tokio::test]
+    async fn run_allows_asr_only_deployment() {
+        // No `tts/` subdirectory at all -- only `asr/` with a discoverable
+        // model. `run()` must not hit the "no models found" bail just
+        // because TTS is absent.
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("asr").join("model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("config.json"),
+            r#"{"model_type": "qwen3_asr"}"#,
+        )
+        .unwrap();
+
+        let args = Args {
+            model_path: dir.path().to_path_buf(),
+            ..args_with_uri("tcp://127.0.0.1:0")
+        };
+        let err = run(args).await.unwrap_err();
+        // Fails later, while actually constructing the ASR model (there
+        // are no real model weights in `model_dir`, so parsing the
+        // deliberately-incomplete `config.json` above fails on the missing
+        // `audio_config` field), not at the "no models found" bail.
+        assert!(!err.to_string().contains("no supported TTS or ASR models"));
+        assert!(err.to_string().contains("audio_config"));
     }
 
     #[test]
