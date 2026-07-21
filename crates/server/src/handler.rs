@@ -141,6 +141,56 @@ impl VoiceMap {
     }
 }
 
+/// Maps ASR model names to model registration names.
+///
+/// Built once at startup from a [`ModelRuntime`]'s registered ASR models.
+/// Unlike [`VoiceMap`], there is no per-voice granularity and no
+/// language-based lookup: Crane's `Asr` trait reports a detected/used
+/// language only per-transcription result, not as a static per-model
+/// capability list, so a `transcribe` request can only select a model by
+/// its registration name or fall back to the default.
+pub struct AsrModelMap {
+    /// Registration names of all configured ASR models that were found in
+    /// the runtime.
+    model_names: HashSet<String>,
+    /// Name of the default ASR model, used when a `transcribe` event
+    /// specifies no model name.
+    default_model: Option<String>,
+}
+
+impl AsrModelMap {
+    /// Build an ASR model map from a [`ModelRuntime`].
+    ///
+    /// `model_names` lists model registration names to include; names not
+    /// found in `runtime` are skipped.
+    #[must_use]
+    pub fn new(model_names: &[String], runtime: &ModelRuntime) -> Self {
+        let mut found_names = HashSet::new();
+        for name in model_names {
+            if runtime.asr_handle(name).is_some() {
+                found_names.insert(name.clone());
+            }
+        }
+        let default_model = runtime.default_asr_name().map(String::from);
+        Self {
+            model_names: found_names,
+            default_model,
+        }
+    }
+
+    /// Returns `true` if `name` is a configured model registration name.
+    #[must_use]
+    pub fn has_model(&self, name: &str) -> bool {
+        self.model_names.contains(name)
+    }
+
+    /// Returns the default model's registration name, if any ASR model is loaded.
+    #[must_use]
+    pub fn default_model(&self) -> Option<&str> {
+        self.default_model.as_deref()
+    }
+}
+
 /// Outcome of resolving a `synthesize` event's voice to a model.
 enum VoiceResolution<'m> {
     /// A model was resolved. `voice_name` is `None` when the client did not
@@ -695,6 +745,7 @@ mod tests {
     use super::*;
     use candle_core::{Device, Tensor};
     use crane::audio::tts::{AudioInfo, Tts, TtsStream, VoiceInfo};
+    use crane::audio::{Asr, TranscribeOptions, Transcript};
     use std::io::Cursor as SyncCursor;
     use tokio::io::BufReader;
     use wyoming_protocol::event::SynthesizeVoice;
@@ -1696,6 +1747,84 @@ mod tests {
 
         let vm = VoiceMap::new(&["first".to_string(), "second".to_string()], &rt);
         assert_eq!(vm.model_for_language("de"), Some(("first", "alice")));
+    }
+
+    struct MockAsr;
+
+    impl Asr for MockAsr {
+        fn input_sample_rate(&self) -> u32 {
+            16000
+        }
+
+        fn transcribe(&mut self, audio: &[f32], _opts: &TranscribeOptions) -> Result<Transcript> {
+            Ok(Transcript {
+                text: format!("heard {} samples", audio.len()),
+                language: None,
+                is_final: true,
+            })
+        }
+    }
+
+    /// Registers `asr` on `Device::Cpu` -- the device is irrelevant to these
+    /// tests since `with_context` is a cheap no-op wrapper on CPU either way.
+    fn register_test_asr(
+        rt: &mut ModelRuntime,
+        name: &str,
+        model_type_name: &'static str,
+        asr: Box<dyn Asr + Send>,
+    ) {
+        rt.register_asr(name.into(), model_type_name, asr, &Device::Cpu)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_asr_model_map_single_model() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+        assert!(am.has_model("m1"));
+    }
+
+    #[test]
+    fn test_asr_model_map_multiple_models() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "a", "qwen3_asr", Box::new(MockAsr));
+        register_test_asr(&mut rt, "b", "qwen3_asr", Box::new(MockAsr));
+
+        let am = AsrModelMap::new(&["a".to_string(), "b".to_string()], &rt);
+        assert!(am.has_model("a"));
+        assert!(am.has_model("b"));
+        assert!(!am.has_model("ghost"));
+    }
+
+    #[test]
+    fn test_asr_model_map_default_model() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+        assert_eq!(am.default_model(), Some("m1"));
+    }
+
+    #[test]
+    fn test_asr_model_map_no_models() {
+        let rt = test_runtime();
+        let am = AsrModelMap::new(&[], &rt);
+        assert_eq!(am.default_model(), None);
+        assert!(!am.has_model("anything"));
+    }
+
+    #[test]
+    fn test_asr_model_map_skips_names_not_in_runtime() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+
+        // "ghost" is listed in the configured names but was never
+        // registered on the runtime, so it must not appear in the map.
+        let am = AsrModelMap::new(&["m1".to_string(), "ghost".to_string()], &rt);
+        assert!(am.has_model("m1"));
+        assert!(!am.has_model("ghost"));
     }
 
     #[tokio::test]
