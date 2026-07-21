@@ -26,7 +26,8 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use tokio::sync::{mpsc, oneshot};
 
-use crane::audio::tts::{AudioInfo, Tts, VoiceInfo};
+use crane::audio::AudioInfo;
+use crane::audio::tts::{Tts, VoiceInfo};
 use crane::audio::{Asr, TranscribeOptions, Transcript};
 use crane_core::generation::SpeechOptions;
 

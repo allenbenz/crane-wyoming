@@ -624,7 +624,8 @@ async fn serve(
 mod tests {
     use super::*;
     use candle_core::{Device, Tensor};
-    use crane::audio::tts::{AudioInfo, Tts, VoiceInfo, pcm_f32_to_i16};
+    use crane::audio::tts::{Tts, VoiceInfo};
+    use crane::audio::{AudioInfo, pcm_f32_to_i16};
     use crane_core::generation::SpeechOptions;
     use std::ops::ControlFlow;
     use tokio::net::{TcpListener, TcpStream};

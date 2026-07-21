@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use candle_core::{DType, Tensor};
-use crane::audio::tts::{AudioInfo, pcm_f32_to_i16};
+use crane::audio::{AudioInfo, pcm_f32_to_i16};
 use crane_core::generation::SpeechOptions;
 
 use crate::engine::{ModelRuntime, TtsGenerateRequest, TtsHandle};
@@ -744,7 +744,8 @@ where
 mod tests {
     use super::*;
     use candle_core::{Device, Tensor};
-    use crane::audio::tts::{AudioInfo, Tts, TtsStream, VoiceInfo};
+    use crane::audio::AudioInfo;
+    use crane::audio::tts::{Tts, TtsStream, VoiceInfo};
     use crane::audio::{Asr, TranscribeOptions, Transcript};
     use std::io::Cursor as SyncCursor;
     use tokio::io::BufReader;
