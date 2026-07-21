@@ -102,7 +102,7 @@ def download_model(model_key, path, token):
         sys.exit(1)
 
     info = MODELS[model_key]
-    local_dir = os.path.join(os.path.expanduser(path), info["dirname"])
+    local_dir = os.path.join(os.path.expanduser(path), info["kind"], info["dirname"])
 
     print(f"Downloading {info['repo_id']} to {local_dir} ...")
     try:
@@ -119,8 +119,7 @@ def download_model(model_key, path, token):
             )
         sys.exit(1)
 
-    flag = "--asr-model-path" if info["kind"] == "asr" else "--model-path"
-    print(f"\nDone. Use with: crane-wyoming {flag} {os.path.expanduser(path)}")
+    print(f"\nDone. Use with: crane-wyoming --model-path {os.path.expanduser(path)}")
 
 
 def main():
