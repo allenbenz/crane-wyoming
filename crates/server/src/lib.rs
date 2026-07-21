@@ -16,7 +16,7 @@
 pub mod engine;
 pub mod handler;
 
-pub use handler::{VoiceMap, handle_connection};
+pub use handler::{AsrModelMap, VoiceMap, handle_connection};
 pub use wyoming_protocol::error::ProtocolError;
 pub use wyoming_protocol::event::Event;
 pub use wyoming_protocol::wire::{
@@ -402,11 +402,13 @@ enum Stream {
 /// Serve a single Wyoming connection to completion.
 ///
 /// Splits the accepted stream into buffered read/write halves and runs
-/// [`handle_connection`]'s event loop against `runtime` and `voice_map`.
+/// [`handle_connection`]'s event loop against `runtime`, `voice_map`, and
+/// `asr_map`.
 async fn serve_connection(
     stream: Stream,
     runtime: &ModelRuntime,
     voice_map: &VoiceMap,
+    asr_map: &AsrModelMap,
 ) -> Result<()> {
     /// Split a stream into buffered halves and run [`handle_connection`].
     /// A macro (rather than a generic helper) because `TcpStream::into_split`
@@ -416,7 +418,7 @@ async fn serve_connection(
             let (reader, writer) = $stream.into_split();
             let mut reader = tokio::io::BufReader::new(reader);
             let mut writer = tokio::io::BufWriter::new(writer);
-            handle_connection(&mut reader, &mut writer, runtime, voice_map).await
+            handle_connection(&mut reader, &mut writer, runtime, voice_map, asr_map).await
         }};
     }
 
@@ -555,8 +557,12 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let voice_map = VoiceMap::new(&model_names, &runtime);
+    // No ASR models are loaded yet -- `--asr-model-path` is a later addition
+    // -- so this always resolves to an empty map (no ASR models, no default).
+    let asr_map = AsrModelMap::new(&[], &runtime);
     let runtime = Arc::new(runtime);
     let voice_map = Arc::new(voice_map);
+    let asr_map = Arc::new(asr_map);
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -566,7 +572,7 @@ pub async fn run(args: Args) -> Result<()> {
     );
 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(args.max_connections));
-    serve(listener, runtime, voice_map, semaphore).await
+    serve(listener, runtime, voice_map, asr_map, semaphore).await
 }
 
 /// Accept and serve Wyoming connections on `listener` until a shutdown
@@ -582,6 +588,7 @@ async fn serve(
     listener: Listener,
     runtime: Arc<ModelRuntime>,
     voice_map: Arc<VoiceMap>,
+    asr_map: Arc<AsrModelMap>,
     semaphore: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
     let mut conn_id: u64 = 0;
@@ -609,8 +616,9 @@ async fn serve(
         info!(peer = %peer_addr, conn = conn_id, "connection accepted");
         let runtime = Arc::clone(&runtime);
         let voice_map = Arc::clone(&voice_map);
+        let asr_map = Arc::clone(&asr_map);
         tokio::spawn(async move {
-            if let Err(e) = serve_connection(stream, &runtime, &voice_map).await {
+            if let Err(e) = serve_connection(stream, &runtime, &voice_map, &asr_map).await {
                 tracing::warn!(peer = %peer_addr, conn = conn_id, error = %e, "connection ended with error");
             }
             drop(permit);
@@ -740,11 +748,13 @@ mod tests {
     async fn spawn_test_server(runtime: ModelRuntime, voice_map: VoiceMap) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let asr_map = AsrModelMap::new(&[], &runtime);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
         tokio::spawn(serve(
             Listener::Tcp(listener),
             Arc::new(runtime),
             Arc::new(voice_map),
+            Arc::new(asr_map),
             semaphore,
         ));
         addr
@@ -1123,8 +1133,15 @@ mod tests {
 
         let rt = test_runtime();
         let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&[], &rt);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
-        tokio::spawn(serve(listener, Arc::new(rt), Arc::new(vm), semaphore));
+        tokio::spawn(serve(
+            listener,
+            Arc::new(rt),
+            Arc::new(vm),
+            Arc::new(am),
+            semaphore,
+        ));
 
         let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
         let (reader, mut writer) = stream.into_split();
@@ -1227,8 +1244,15 @@ mod tests {
 
         let rt = test_runtime();
         let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&[], &rt);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
-        tokio::spawn(serve(listener, Arc::new(rt), Arc::new(vm), semaphore));
+        tokio::spawn(serve(
+            listener,
+            Arc::new(rt),
+            Arc::new(vm),
+            Arc::new(am),
+            semaphore,
+        ));
 
         let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
         let (reader, mut writer) = stream.into_split();

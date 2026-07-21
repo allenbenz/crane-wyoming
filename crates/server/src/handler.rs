@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andreas Schneider <asn@cryptomilk.org>
 
-//! Wyoming event handler for TTS requests.
+//! Wyoming event handler for TTS and ASR requests.
 //!
 //! Provides [`handle_connection`], an async function that runs the event
 //! loop for a single Wyoming client connection: it reads events from an
 //! [`AsyncBufRead`] source, dispatches `synthesize` requests to a
-//! [`ModelRuntime`], and writes `audio-start`/`audio-chunk`/`audio-stop`
-//! responses to an [`AsyncWrite`] sink.
+//! [`ModelRuntime`], writes `audio-start`/`audio-chunk`/`audio-stop`
+//! responses to an [`AsyncWrite`] sink, and handles `transcribe` requests
+//! by collecting audio from the client and replying with a `transcript`.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -15,16 +16,16 @@ use std::time::Duration;
 
 use anyhow::Result;
 use candle_core::{DType, Tensor};
-use crane::audio::{AudioInfo, pcm_f32_to_i16};
+use crane::audio::{AudioInfo, pcm_f32_to_i16, pcm_i16_to_f32};
 use crane_core::generation::SpeechOptions;
 
-use crate::engine::{ModelRuntime, TtsGenerateRequest, TtsHandle};
+use crate::engine::{AsrTranscribeRequest, ModelRuntime, TtsGenerateRequest, TtsHandle};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::oneshot;
 
 use wyoming_protocol::event::{
     AudioChunkData, AudioFormat, AudioStartData, AudioStopData, ErrorData, Event, InfoData,
-    PingData, PongData, SynthesizeData,
+    PingData, PongData, SynthesizeData, TranscribeData, TranscriptData,
 };
 use wyoming_protocol::wire::{read_event, write_event};
 
@@ -184,6 +185,16 @@ impl AsrModelMap {
         self.model_names.contains(name)
     }
 
+    /// Returns the registration name matching `name`, if it's configured.
+    ///
+    /// Unlike [`has_model`](Self::has_model), returns the map's own copy of
+    /// the name so callers can propagate it with a lifetime tied to this
+    /// `AsrModelMap` rather than to their (possibly shorter-lived) input.
+    #[must_use]
+    pub fn model_name(&self, name: &str) -> Option<&str> {
+        self.model_names.get(name).map(String::as_str)
+    }
+
     /// Returns the default model's registration name, if any ASR model is loaded.
     #[must_use]
     pub fn default_model(&self) -> Option<&str> {
@@ -246,6 +257,34 @@ fn resolve_voice<'m>(voice_map: &'m VoiceMap, data: &SynthesizeData) -> VoiceRes
     }
 }
 
+/// Outcome of resolving a `transcribe` event's target model.
+enum AsrResolution<'m> {
+    /// A model was resolved.
+    Found(&'m str),
+    /// The client requested a model name with no matching model.
+    NotFound(String),
+    /// No model was requested and no ASR model is loaded.
+    NoModel,
+}
+
+/// Resolve which ASR model a `transcribe` event should use.
+///
+/// An explicit model name always wins; otherwise falls back to the default
+/// model. Unlike [`resolve_voice`], there is no language-based resolution
+/// step -- see [`AsrModelMap`]'s doc comment for why.
+fn resolve_asr_model<'m>(asr_map: &'m AsrModelMap, data: &TranscribeData) -> AsrResolution<'m> {
+    if let Some(name) = data.name.as_deref() {
+        return match asr_map.model_name(name) {
+            Some(model_name) => AsrResolution::Found(model_name),
+            None => AsrResolution::NotFound(name.to_string()),
+        };
+    }
+    match asr_map.default_model() {
+        Some(model_name) => AsrResolution::Found(model_name),
+        None => AsrResolution::NoModel,
+    }
+}
+
 /// How long to wait for the next event before disconnecting an idle client.
 const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -263,14 +302,29 @@ const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 /// chunk receiver, unblocking the worker.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Sample width, in bytes, that ASR models expect (16-bit PCM).
+const EXPECTED_SAMPLE_WIDTH: u16 = 2;
+
+/// Channel count that ASR models expect (mono).
+const EXPECTED_CHANNELS: u16 = 1;
+
+/// Maximum total size, in bytes, of the PCM audio collected for a single
+/// `transcribe` request.
+///
+/// Bounds memory use against a client that keeps sending `audio-chunk`
+/// events indefinitely; 1 MiB is about 30 seconds of 16-bit mono audio at
+/// 16 kHz, comfortably more than a single voice-assistant utterance.
+const MAX_TRANSCRIBE_AUDIO_BYTES: usize = 1024 * 1024;
+
 /// Run the Wyoming event loop for a single client connection.
 ///
 /// Reads events from `reader` and dispatches them: `synthesize` requests
-/// generate speech through `runtime`, `ping` is answered with `pong`,
-/// `describe` gets an `info` response with available TTS model metadata, and unrecognized
-/// event types get an `error` response. The loop continues until the
-/// client disconnects cleanly (EOF), the wire protocol desyncs, or the
-/// client goes idle for longer than [`IDLE_TIMEOUT`] between events.
+/// generate speech through `runtime`, `transcribe` requests collect audio
+/// and reply with a transcript, `ping` is answered with `pong`, `describe`
+/// gets an `info` response with available TTS/ASR model metadata, and
+/// unrecognized event types get an `error` response. The loop continues
+/// until the client disconnects cleanly (EOF), the wire protocol desyncs,
+/// or the client goes idle for longer than [`IDLE_TIMEOUT`] between events.
 ///
 /// Application-level failures (unknown voice, generation error) are
 /// reported as Wyoming `error` events and do not terminate the
@@ -283,7 +337,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// the oneshot sender for [`handle_synthesize_blob`], or the chunk sender
 /// for [`handle_synthesize_streaming`]. The TTS thread checks for this
 /// before generation (and, for streaming, after each chunk) and stops
-/// instead of blocking or erroring.
+/// instead of blocking or erroring. The same applies to a `transcribe`
+/// request in flight in [`handle_transcribe`]: the ASR thread checks its
+/// oneshot sender before transcribing.
 ///
 /// # Errors
 ///
@@ -293,6 +349,7 @@ pub async fn handle_connection<R, W>(
     writer: &mut W,
     runtime: &ModelRuntime,
     voice_map: &VoiceMap,
+    asr_map: &AsrModelMap,
 ) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
@@ -321,6 +378,9 @@ where
 
         match event {
             Event::Synthesize(data) => handle_synthesize(writer, runtime, voice_map, data).await?,
+            Event::Transcribe(data) => {
+                handle_transcribe(reader, writer, runtime, asr_map, data).await?;
+            },
             Event::Ping(data) => handle_ping(writer, data).await?,
             Event::Describe => handle_describe(writer, runtime, voice_map).await?,
             Event::Unknown { event_type, .. } => {
@@ -635,6 +695,242 @@ where
     Ok(())
 }
 
+/// Wait for the next event during audio collection (part of handling a
+/// `transcribe` request), giving up after [`IDLE_TIMEOUT`].
+///
+/// Returns `Ok(None)` if the client disconnected cleanly or went idle --
+/// both end the connection the same way the main loop in
+/// [`handle_connection`] does, so callers should return `Ok(())` in that
+/// case rather than treating it as an error.
+async fn read_event_or_idle<R>(reader: &mut R) -> Result<Option<Event>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    match tokio::time::timeout(IDLE_TIMEOUT, read_event(reader)).await {
+        Ok(Ok(Some(event))) => Ok(Some(event)),
+        Ok(Ok(None)) => {
+            tracing::debug!("Client disconnected during audio collection");
+            Ok(None)
+        },
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            tracing::info!(
+                "Client idle for {IDLE_TIMEOUT:?} during audio collection, disconnecting",
+            );
+            Ok(None)
+        },
+    }
+}
+
+/// Builds the error message for an `audio-start`/`audio-chunk` whose format
+/// doesn't match what the resolved ASR model expects.
+fn unsupported_audio_format_message(
+    rate: u32,
+    width: u16,
+    channels: u16,
+    expected_rate: u32,
+) -> String {
+    format!(
+        "Unsupported audio format: rate={rate}, width={width}, channels={channels} \
+         (expected rate={expected_rate}, width={EXPECTED_SAMPLE_WIDTH}, channels={EXPECTED_CHANNELS})",
+    )
+}
+
+/// Reads the `audio-start`/`audio-chunk`*/`audio-stop` sequence for one
+/// `transcribe` exchange and returns the collected PCM bytes.
+///
+/// `audio-start`, and every subsequent `audio-chunk`, must declare the
+/// exact format the model expects (16-bit mono PCM at `expected_rate`);
+/// resampling is not implemented, so a mismatched format is rejected with
+/// an `error` event rather than silently misinterpreted. The total
+/// collected size is capped at [`MAX_TRANSCRIBE_AUDIO_BYTES`].
+///
+/// Returns `Ok(None)` if the client disconnected, went idle, sent an
+/// unexpected event, or exceeded a limit above -- in all of these cases an
+/// `error` event has already been sent (if applicable) and the caller
+/// should end the `transcribe` exchange by returning `Ok(())`.
+async fn collect_transcribe_audio<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    expected_rate: u32,
+) -> Result<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let Some(event) = read_event_or_idle(reader).await? else {
+        return Ok(None);
+    };
+    let Event::AudioStart(start) = event else {
+        tracing::warn!(
+            event_type = %event.event_type(),
+            "Expected audio-start after transcribe",
+        );
+        send_error(writer, "Expected audio-start after transcribe", None).await?;
+        return Ok(None);
+    };
+    if start.rate != expected_rate
+        || start.width != EXPECTED_SAMPLE_WIDTH
+        || start.channels != EXPECTED_CHANNELS
+    {
+        send_error(
+            writer,
+            &unsupported_audio_format_message(
+                start.rate,
+                start.width,
+                start.channels,
+                expected_rate,
+            ),
+            Some("unsupported-audio-format"),
+        )
+        .await?;
+        return Ok(None);
+    }
+
+    let mut pcm_bytes = Vec::new();
+    loop {
+        let Some(event) = read_event_or_idle(reader).await? else {
+            return Ok(None);
+        };
+        match event {
+            Event::AudioChunk { data, audio } => {
+                if data.rate != expected_rate
+                    || data.width != EXPECTED_SAMPLE_WIDTH
+                    || data.channels != EXPECTED_CHANNELS
+                {
+                    send_error(
+                        writer,
+                        &unsupported_audio_format_message(
+                            data.rate,
+                            data.width,
+                            data.channels,
+                            expected_rate,
+                        ),
+                        Some("unsupported-audio-format"),
+                    )
+                    .await?;
+                    return Ok(None);
+                }
+                if pcm_bytes.len() + audio.len() > MAX_TRANSCRIBE_AUDIO_BYTES {
+                    send_error(
+                        writer,
+                        &format!(
+                            "Audio exceeds maximum size of \
+                             {MAX_TRANSCRIBE_AUDIO_BYTES} bytes for a single transcribe request",
+                        ),
+                        Some("audio-too-large"),
+                    )
+                    .await?;
+                    return Ok(None);
+                }
+                pcm_bytes.extend_from_slice(&audio);
+            },
+            Event::AudioStop(_) => break,
+            other => {
+                tracing::warn!(
+                    event_type = %other.event_type(),
+                    "Expected audio-chunk or audio-stop during transcribe",
+                );
+                send_error(
+                    writer,
+                    "Expected audio-chunk or audio-stop during transcribe",
+                    None,
+                )
+                .await?;
+                return Ok(None);
+            },
+        }
+    }
+
+    Ok(Some(pcm_bytes))
+}
+
+/// Handle a `transcribe` event: collect the client's audio and reply with a
+/// `transcript`.
+///
+/// Resolves the requested ASR model, then reads the following
+/// `audio-start`/`audio-chunk`*/`audio-stop` sequence via
+/// [`collect_transcribe_audio`] -- these are read directly here rather than
+/// by the caller's main event loop, since they belong to this one
+/// `transcribe` exchange.
+///
+/// Unlike [`handle_synthesize`], there is only one dispatch path (batch):
+/// streaming transcript delivery is a later addition.
+async fn handle_transcribe<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    runtime: &ModelRuntime,
+    asr_map: &AsrModelMap,
+    data: TranscribeData,
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let model_name = match resolve_asr_model(asr_map, &data) {
+        AsrResolution::Found(model_name) => model_name,
+        AsrResolution::NotFound(name) => {
+            tracing::warn!(model = %name, "ASR model not found");
+            return send_error(
+                writer,
+                &format!("Unknown ASR model: {name}"),
+                Some("asr-model-not-found"),
+            )
+            .await;
+        },
+        AsrResolution::NoModel => {
+            return send_error(writer, "No ASR model loaded", None).await;
+        },
+    };
+
+    let Some(handle) = runtime.asr_handle(model_name) else {
+        return send_error(
+            writer,
+            &format!("ASR model '{model_name}' unavailable"),
+            None,
+        )
+        .await;
+    };
+    let expected_rate = handle.input_sample_rate();
+
+    let Some(pcm_bytes) = collect_transcribe_audio(reader, writer, expected_rate).await? else {
+        return Ok(());
+    };
+
+    let audio = pcm_i16_to_f32(&pcm_bytes);
+    let (tx, rx) = oneshot::channel();
+    let req = AsrTranscribeRequest {
+        audio,
+        language: data.language,
+        response_tx: tx,
+    };
+
+    if let Err(e) = runtime.transcribe(model_name, req) {
+        tracing::error!(error = %e, "Failed to dispatch ASR request");
+        return send_error(writer, &format!("ASR engine unavailable: {e}"), None).await;
+    }
+
+    let transcript = match rx.await {
+        Ok(Ok(transcript)) => transcript,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "ASR transcription failed");
+            return send_error(writer, &format!("ASR transcription failed: {e}"), None).await;
+        },
+        Err(_) => {
+            tracing::error!("ASR thread dropped the response channel");
+            return send_error(writer, "ASR engine did not respond", None).await;
+        },
+    };
+
+    let mut result = TranscriptData::new(transcript.text);
+    if let Some(language) = transcript.language {
+        result = result.with_language(language);
+    }
+    write_event(writer, &Event::Transcript(result)).await?;
+
+    Ok(())
+}
+
 /// Answer a `ping` event with a `pong` echoing the same text.
 async fn handle_ping<W>(writer: &mut W, data: PingData) -> Result<()>
 where
@@ -649,8 +945,11 @@ where
 /// Answer a `describe` event with service discovery info.
 ///
 /// Lists every TTS model registered in `runtime` as a `tts` program
-/// descriptor, including its voices. ASR and wake-word lists are always
-/// empty (Crane does not yet serve those over Wyoming).
+/// descriptor, including its voices. The `asr` and `wake` lists are always
+/// empty: `--asr-model-path` (which will populate a non-empty
+/// [`AsrModelMap`]) isn't implemented yet, and wake-word models aren't
+/// served over Wyoming at all. TODO: once `--asr-model-path` lands, list
+/// loaded ASR models here too, analogous to the `tts` list.
 async fn handle_describe<W>(
     writer: &mut W,
     runtime: &ModelRuntime,
@@ -939,6 +1238,7 @@ mod tests {
     async fn run_events(
         runtime: &ModelRuntime,
         voice_map: &VoiceMap,
+        asr_map: &AsrModelMap,
         events: Vec<Event>,
     ) -> Vec<Event> {
         let mut input = Vec::new();
@@ -947,7 +1247,7 @@ mod tests {
         }
         let mut reader = BufReader::new(SyncCursor::new(input));
         let mut output = Vec::new();
-        handle_connection(&mut reader, &mut output, runtime, voice_map)
+        handle_connection(&mut reader, &mut output, runtime, voice_map, asr_map)
             .await
             .unwrap();
 
@@ -973,6 +1273,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
+            &AsrModelMap::new(&[], &rt),
             vec![Event::Synthesize(SynthesizeData::new("hello"))],
         )
         .await;
@@ -1015,6 +1316,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
+            &AsrModelMap::new(&[], &rt),
             vec![Event::Synthesize(
                 SynthesizeData::new("hi").with_voice(SynthesizeVoice::with_name("bob")),
             )],
@@ -1064,6 +1366,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
+            &AsrModelMap::new(&[], &rt),
             vec![Event::Synthesize(
                 SynthesizeData::new("hi").with_voice(voice),
             )],
@@ -1112,6 +1415,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
+            &AsrModelMap::new(&[], &rt),
             vec![Event::Synthesize(
                 SynthesizeData::new("hi").with_voice(voice),
             )],
@@ -1160,6 +1464,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
+            &AsrModelMap::new(&[], &rt),
             vec![Event::Synthesize(
                 SynthesizeData::new("hi").with_voice(voice),
             )],
@@ -1186,6 +1491,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
+            &AsrModelMap::new(&[], &rt),
             vec![Event::Synthesize(
                 SynthesizeData::new("hi").with_voice(SynthesizeVoice::with_name("ghost")),
             )],
@@ -1206,8 +1512,13 @@ mod tests {
         let rt = test_runtime();
         let vm = VoiceMap::new(&[], &rt);
 
-        let results =
-            run_events(&rt, &vm, vec![Event::Synthesize(SynthesizeData::new("hi"))]).await;
+        let results = run_events(
+            &rt,
+            &vm,
+            &AsrModelMap::new(&[], &rt),
+            vec![Event::Synthesize(SynthesizeData::new("hi"))],
+        )
+        .await;
 
         assert_eq!(results.len(), 1);
         assert!(matches!(&results[0], Event::Error(_)));
@@ -1219,8 +1530,13 @@ mod tests {
         register_test_tts(&mut rt, "m1", "qwen3_tts", Box::new(FailingTts));
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
-        let results =
-            run_events(&rt, &vm, vec![Event::Synthesize(SynthesizeData::new("hi"))]).await;
+        let results = run_events(
+            &rt,
+            &vm,
+            &AsrModelMap::new(&[], &rt),
+            vec![Event::Synthesize(SynthesizeData::new("hi"))],
+        )
+        .await;
 
         assert_eq!(results.len(), 1);
         match &results[0] {
@@ -1243,6 +1559,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
+            &AsrModelMap::new(&[], &rt),
             vec![Event::Synthesize(SynthesizeData::new("hello"))],
         )
         .await;
@@ -1278,6 +1595,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
+            &AsrModelMap::new(&[], &rt),
             vec![Event::Synthesize(SynthesizeData::new(String::new()))],
         )
         .await;
@@ -1306,6 +1624,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
+            &AsrModelMap::new(&[], &rt),
             vec![Event::Synthesize(SynthesizeData::new("hello"))],
         )
         .await;
@@ -1342,8 +1661,13 @@ mod tests {
         );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
-        let results =
-            run_events(&rt, &vm, vec![Event::Synthesize(SynthesizeData::new("hi"))]).await;
+        let results = run_events(
+            &rt,
+            &vm,
+            &AsrModelMap::new(&[], &rt),
+            vec![Event::Synthesize(SynthesizeData::new("hi"))],
+        )
+        .await;
 
         assert_eq!(
             results.len(),
@@ -1364,7 +1688,13 @@ mod tests {
         let rt = test_runtime();
         let vm = VoiceMap::new(&[], &rt);
 
-        let results = run_events(&rt, &vm, vec![Event::Ping(PingData::with_text("hi"))]).await;
+        let results = run_events(
+            &rt,
+            &vm,
+            &AsrModelMap::new(&[], &rt),
+            vec![Event::Ping(PingData::with_text("hi"))],
+        )
+        .await;
 
         assert_eq!(results, vec![Event::Pong(PongData::with_text("hi"))]);
     }
@@ -1374,7 +1704,13 @@ mod tests {
         let rt = test_runtime();
         let vm = VoiceMap::new(&[], &rt);
 
-        let results = run_events(&rt, &vm, vec![Event::Ping(PingData::new())]).await;
+        let results = run_events(
+            &rt,
+            &vm,
+            &AsrModelMap::new(&[], &rt),
+            vec![Event::Ping(PingData::new())],
+        )
+        .await;
 
         assert_eq!(results, vec![Event::Pong(PongData::new())]);
     }
@@ -1384,7 +1720,8 @@ mod tests {
         let rt = test_runtime();
         let vm = VoiceMap::new(&[], &rt);
 
-        let results = run_events(&rt, &vm, vec![Event::Describe]).await;
+        let results =
+            run_events(&rt, &vm, &AsrModelMap::new(&[], &rt), vec![Event::Describe]).await;
 
         assert_eq!(results, vec![Event::Info(InfoData::default())]);
     }
@@ -1400,7 +1737,8 @@ mod tests {
         );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
-        let results = run_events(&rt, &vm, vec![Event::Describe]).await;
+        let results =
+            run_events(&rt, &vm, &AsrModelMap::new(&[], &rt), vec![Event::Describe]).await;
 
         assert_eq!(results.len(), 1);
         match &results[0] {
@@ -1437,7 +1775,8 @@ mod tests {
         );
         let vm = VoiceMap::new(&["a".to_string(), "b".to_string()], &rt);
 
-        let results = run_events(&rt, &vm, vec![Event::Describe]).await;
+        let results =
+            run_events(&rt, &vm, &AsrModelMap::new(&[], &rt), vec![Event::Describe]).await;
 
         match &results[0] {
             Event::Info(data) => {
@@ -1470,7 +1809,8 @@ mod tests {
         );
         let vm = VoiceMap::new(&["first".to_string(), "second".to_string()], &rt);
 
-        let results = run_events(&rt, &vm, vec![Event::Describe]).await;
+        let results =
+            run_events(&rt, &vm, &AsrModelMap::new(&[], &rt), vec![Event::Describe]).await;
 
         match &results[0] {
             Event::Info(data) => {
@@ -1506,7 +1846,8 @@ mod tests {
         );
         let vm = VoiceMap::new(&["configured".to_string()], &rt);
 
-        let results = run_events(&rt, &vm, vec![Event::Describe]).await;
+        let results =
+            run_events(&rt, &vm, &AsrModelMap::new(&[], &rt), vec![Event::Describe]).await;
 
         match &results[0] {
             Event::Info(data) => {
@@ -1528,7 +1869,8 @@ mod tests {
         );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
-        let results = run_events(&rt, &vm, vec![Event::Describe]).await;
+        let results =
+            run_events(&rt, &vm, &AsrModelMap::new(&[], &rt), vec![Event::Describe]).await;
 
         match &results[0] {
             Event::Info(data) => {
@@ -1550,7 +1892,8 @@ mod tests {
         );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
-        let results = run_events(&rt, &vm, vec![Event::Describe]).await;
+        let results =
+            run_events(&rt, &vm, &AsrModelMap::new(&[], &rt), vec![Event::Describe]).await;
 
         match &results[0] {
             Event::Info(data) => {
@@ -1568,6 +1911,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
+            &AsrModelMap::new(&[], &rt),
             vec![Event::Unknown {
                 event_type: "future-event".into(),
                 data: serde_json::json!({}),
@@ -1587,9 +1931,10 @@ mod tests {
     async fn test_eof_returns_ok() {
         let rt = test_runtime();
         let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&[], &rt);
         let mut reader = BufReader::new(SyncCursor::new(Vec::<u8>::new()));
         let mut writer = Vec::new();
-        let result = handle_connection(&mut reader, &mut writer, &rt, &vm).await;
+        let result = handle_connection(&mut reader, &mut writer, &rt, &vm, &am).await;
         assert!(result.is_ok());
         assert!(writer.is_empty());
     }
@@ -1608,6 +1953,7 @@ mod tests {
         let results = run_events(
             &rt,
             &vm,
+            &AsrModelMap::new(&[], &rt),
             vec![
                 Event::Ping(PingData::with_text("a")),
                 Event::Synthesize(SynthesizeData::new("hi")),
@@ -1757,12 +2103,24 @@ mod tests {
             16000
         }
 
-        fn transcribe(&mut self, audio: &[f32], _opts: &TranscribeOptions) -> Result<Transcript> {
+        fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOptions) -> Result<Transcript> {
             Ok(Transcript {
                 text: format!("heard {} samples", audio.len()),
-                language: None,
+                language: opts.language.clone(),
                 is_final: true,
             })
+        }
+    }
+
+    struct FailingAsr;
+
+    impl Asr for FailingAsr {
+        fn input_sample_rate(&self) -> u32 {
+            16000
+        }
+
+        fn transcribe(&mut self, _audio: &[f32], _opts: &TranscribeOptions) -> Result<Transcript> {
+            anyhow::bail!("mock transcription failure")
         }
     }
 
@@ -1828,6 +2186,414 @@ mod tests {
         assert!(!am.has_model("ghost"));
     }
 
+    /// 16kHz mono 16-bit PCM format, matching `MockAsr::input_sample_rate`.
+    fn mock_asr_format() -> AudioFormat {
+        AudioFormat {
+            rate: 16000,
+            width: 2,
+            channels: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_default_model() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 4]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            results,
+            vec![Event::Transcript(TranscriptData::new("heard 4 samples"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_named_model() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "a", "qwen3_asr", Box::new(MockAsr));
+        register_test_asr(&mut rt, "b", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["a".to_string(), "b".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new().with_name("b")),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 2]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            results,
+            vec![Event::Transcript(TranscriptData::new("heard 2 samples"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_language_hint_forwarded() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new().with_language("de")),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 1]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            results,
+            vec![Event::Transcript(
+                TranscriptData::new("heard 1 samples").with_language("de")
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_no_asr_model_loaded() {
+        let rt = test_runtime();
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&[], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![Event::Transcribe(TranscribeData::new())],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Event::Error(data) => assert_eq!(data.code, None),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_unknown_model() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![Event::Transcribe(TranscribeData::new().with_name("ghost"))],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Event::Error(data) => assert_eq!(data.code.as_deref(), Some("asr-model-not-found")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_wrong_sample_rate() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(AudioFormat {
+                    rate: 8000,
+                    ..mock_asr_format()
+                })),
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Event::Error(data) => {
+                assert_eq!(data.code.as_deref(), Some("unsupported-audio-format"));
+            },
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_wrong_channels() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(AudioFormat {
+                    channels: 2,
+                    ..mock_asr_format()
+                })),
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Event::Error(data) => {
+                assert_eq!(data.code.as_deref(), Some("unsupported-audio-format"));
+            },
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_wrong_width() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(AudioFormat {
+                    width: 4,
+                    ..mock_asr_format()
+                })),
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Event::Error(data) => {
+                assert_eq!(data.code.as_deref(), Some("unsupported-audio-format"));
+            },
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_chunk_format_mismatch() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(AudioFormat {
+                        rate: 8000,
+                        ..mock_asr_format()
+                    }),
+                    audio: pcm_f32_to_i16(&[0.0; 4]),
+                },
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Event::Error(data) => {
+                assert_eq!(data.code.as_deref(), Some("unsupported-audio-format"));
+            },
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_multi_chunk() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 2]),
+                },
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 3]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            results,
+            vec![Event::Transcript(TranscriptData::new("heard 5 samples"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_audio_too_large() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        // One f32 sample becomes 2 PCM bytes; send one more sample than fits
+        // in MAX_TRANSCRIBE_AUDIO_BYTES.
+        let too_many_samples = MAX_TRANSCRIBE_AUDIO_BYTES / 2 + 1;
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&vec![0.0; too_many_samples]),
+                },
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Event::Error(data) => {
+                assert_eq!(data.code.as_deref(), Some("audio-too-large"));
+            },
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_unexpected_event_during_chunks() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::Ping(PingData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], Event::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_transcription_failure() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(FailingAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 4]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Event::Error(data) => assert!(data.text.contains("mock transcription failure")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_missing_audio_start() {
+        let mut rt = test_runtime();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::Ping(PingData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], Event::Error(_)));
+    }
+
     #[tokio::test]
     async fn test_audio_start_width_is_bytes() {
         let mut rt = test_runtime();
@@ -1839,8 +2605,13 @@ mod tests {
         );
         let vm = VoiceMap::new(&["m1".to_string()], &rt);
 
-        let results =
-            run_events(&rt, &vm, vec![Event::Synthesize(SynthesizeData::new("hi"))]).await;
+        let results = run_events(
+            &rt,
+            &vm,
+            &AsrModelMap::new(&[], &rt),
+            vec![Event::Synthesize(SynthesizeData::new("hi"))],
+        )
+        .await;
 
         match &results[0] {
             Event::AudioStart(data) => assert_eq!(data.width, 2),
