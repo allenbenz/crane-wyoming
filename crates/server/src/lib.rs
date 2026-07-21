@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andreas Schneider <asn@cryptomilk.org>
 
-//! Wyoming protocol TTS server for Home Assistant voice integration.
+//! Wyoming protocol TTS/ASR server for Home Assistant voice integration.
 //!
 //! # Module layout
 //!
-//! | Module    | Responsibility                                       |
-//! |-----------|-------------------------------------------------------|
-//! | `engine`  | `ModelRuntime` -- owns and dispatches to TTS models   |
-//! | `handler` | TTS event handling, dispatching to `ModelRuntime`     |
+//! | Module    | Responsibility                                         |
+//! |-----------|----------------------------------------------------------|
+//! | `engine`  | `ModelRuntime` -- owns and dispatches to TTS/ASR models |
+//! | `handler` | TTS/ASR event handling, dispatching to `ModelRuntime`   |
 //!
 //! The wire protocol types (`Event`, `read_event`, `write_event`) are
 //! implemented in and re-exported from the [`wyoming_protocol`] crate.
@@ -33,15 +33,18 @@ use tracing::{info, warn};
 use crate::engine::ModelRuntime;
 use crate::engine::model_factory::DiscoveredModel;
 
-/// Command-line arguments for the Wyoming protocol TTS server.
+/// Command-line arguments for the Wyoming protocol TTS/ASR server.
 #[derive(Parser, Debug, Clone)]
-#[command(about = "Wyoming protocol TTS server for Home Assistant voice integration")]
+#[command(about = "Wyoming protocol TTS/ASR server for Home Assistant voice integration")]
 pub struct Args {
-    /// Parent directory containing TTS model subdirectories. All recognized
-    /// models found as immediate subdirectories are loaded, unless
-    /// restricted with `--model`. The first loaded model (alphabetically,
-    /// or by `--model` order if given) becomes the default voice when a
-    /// client does not request one by name.
+    /// Parent directory containing a `tts/` and/or `asr/` subdirectory,
+    /// each holding model subdirectories for that family. All recognized
+    /// models found as immediate subdirectories of `tts/` are loaded,
+    /// unless restricted with `--model-tts`. The first loaded TTS model
+    /// (alphabetically, or by `--model-tts` order if given) becomes the
+    /// default voice when a client does not request one by name. A missing
+    /// `tts/` or `asr/` subdirectory means zero models of that family, not
+    /// an error.
     #[arg(
         short = 'm',
         long = "model-path",
@@ -50,12 +53,16 @@ pub struct Args {
     )]
     pub model_path: PathBuf,
 
-    /// Load only the named model subdirectories from `--model-path`
+    /// Load only the named model subdirectories from `<model-path>/tts`
     /// (directory name, not full path). Repeatable, or separate multiple
     /// names with `;`; order determines voice priority (first = default).
-    /// When omitted, all recognized models are loaded alphabetically.
-    #[arg(long = "model", env = "CRANE_WYOMING_MODEL", value_delimiter = ';')]
-    pub model: Vec<String>,
+    /// When omitted, all recognized TTS models are loaded alphabetically.
+    #[arg(
+        long = "model-tts",
+        env = "CRANE_WYOMING_MODEL_TTS",
+        value_delimiter = ';'
+    )]
+    pub model_tts: Vec<String>,
 
     /// List the models recognized under `--model-path` and exit, without
     /// starting the server.
@@ -429,29 +436,82 @@ async fn serve_connection(
     }
 }
 
-/// Print the models [`engine::model_factory::discover_models`] found under
-/// `model_path`, for `--list-models`.
-fn print_discovered_models(
-    model_path: &std::path::Path,
-    discovered: &[engine::model_factory::DiscoveredModel],
-) {
-    if discovered.is_empty() {
-        println!("No supported models found in '{}'", model_path.display());
-        return;
-    }
-    println!("Models in '{}':\n", model_path.display());
-    for m in discovered {
-        println!("  {}  ({})", m.name, m.model_type.display_name());
+/// Directory name, under `--model-path`, holding TTS model subdirectories.
+const TTS_SUBDIR: &str = "tts";
+/// Directory name, under `--model-path`, holding ASR model subdirectories.
+const ASR_SUBDIR: &str = "asr";
+
+/// Scan `dir` for models with `discover`, treating a *missing* `dir` as
+/// "zero models" rather than an error.
+///
+/// `--model-path` is a directory containing `tts/`/`asr/` subdirectories;
+/// either one may legitimately be absent (e.g. an ASR-only deployment has
+/// no `tts/` subdirectory at all), which shouldn't fail the scan. Other
+/// failures to access `dir` (e.g. permission denied, or `dir` existing as a
+/// non-directory) are real problems and are propagated rather than
+/// silently treated as "zero models".
+///
+/// # Errors
+///
+/// Returns an error if `dir` exists but cannot be scanned for models.
+fn discover_or_empty(
+    dir: &std::path::Path,
+    discover: impl Fn(&std::path::Path) -> Result<Vec<DiscoveredModel>>,
+) -> Result<Vec<DiscoveredModel>> {
+    match std::fs::metadata(dir) {
+        Ok(_) => discover(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format!("cannot access '{}'", dir.display())),
     }
 }
 
-/// Run the Wyoming protocol TTS server.
+/// Print the TTS and ASR models found under `<model_path>/tts` and
+/// `<model_path>/asr`, for `--list-models`.
 ///
-/// Discovers TTS models under `--model-path` (optionally restricted by
-/// `--model`). If `--list-models` is set, prints the discovered models and
-/// returns without starting the server. Otherwise loads them into a shared
-/// [`ModelRuntime`], optionally enables the on-disk TTS cache, then accepts
-/// connections on the address resolved from `--uri` (or
+/// # Errors
+///
+/// Returns an error if a `tts`/`asr` subdirectory exists but cannot be read.
+fn print_discovered_models(model_path: &std::path::Path) -> Result<()> {
+    let tts = discover_or_empty(
+        &model_path.join(TTS_SUBDIR),
+        engine::model_factory::discover_models,
+    )?;
+    let asr = discover_or_empty(
+        &model_path.join(ASR_SUBDIR),
+        engine::model_factory::discover_asr_models,
+    )?;
+
+    if tts.is_empty() && asr.is_empty() {
+        println!("No supported models found in '{}'", model_path.display());
+        return Ok(());
+    }
+
+    print_model_group("TTS models:", &tts);
+    println!();
+    print_model_group("ASR models:", &asr);
+
+    Ok(())
+}
+
+/// Print one `--list-models` section: a header followed by one line per
+/// model, or `(none)` if `models` is empty.
+fn print_model_group(header: &str, models: &[DiscoveredModel]) {
+    println!("{header}");
+    for m in models {
+        println!("  {}  ({})", m.name, m.model_type.display_name());
+    }
+    if models.is_empty() {
+        println!("  (none)");
+    }
+}
+
+/// Run the Wyoming protocol TTS/ASR server.
+///
+/// Discovers TTS models under `<model-path>/tts` (optionally restricted by
+/// `--model-tts`). If `--list-models` is set, prints the discovered models
+/// and returns without starting the server. Otherwise loads them into a
+/// shared [`ModelRuntime`], optionally enables the on-disk TTS cache, then
+/// accepts connections on the address resolved from `--uri` (or
 /// `args.host`:`args.port` if unset) -- either TCP or a Unix domain socket.
 /// Each connection is handled on its own tokio task via
 /// [`handle_connection`]; TTS requests from all connections queue on the
@@ -459,22 +519,32 @@ fn print_discovered_models(
 ///
 /// # Errors
 ///
-/// Returns an error if no supported models are found, a named `--model`
-/// doesn't match a discovered model or is repeated, a model fails to load,
-/// or the listener cannot bind.
+/// Returns an error if `--model-path` doesn't exist or isn't a directory,
+/// no supported TTS models are found under `<model-path>/tts`, a named
+/// `--model-tts` doesn't match a discovered model or is repeated, a model
+/// fails to load, or the listener cannot bind.
 pub async fn run(args: Args) -> Result<()> {
-    let discovered = engine::model_factory::discover_models(&args.model_path)?;
-
     if args.list_models {
-        print_discovered_models(&args.model_path, &discovered);
+        print_discovered_models(&args.model_path)?;
         return Ok(());
     }
 
-    if discovered.is_empty() {
-        anyhow::bail!(
-            "no supported TTS models found in '{}'",
+    match std::fs::metadata(&args.model_path) {
+        Ok(meta) if meta.is_dir() => {},
+        Ok(_) => anyhow::bail!(
+            "model path '{}' is not a directory",
             args.model_path.display()
-        );
+        ),
+        Err(e) => {
+            return Err(e).with_context(|| format!("model path '{}'", args.model_path.display()));
+        },
+    }
+
+    let tts_dir = args.model_path.join(TTS_SUBDIR);
+    let discovered = discover_or_empty(&tts_dir, engine::model_factory::discover_models)?;
+
+    if discovered.is_empty() {
+        anyhow::bail!("no supported TTS models found in '{}'", tts_dir.display());
     }
 
     let device = if args.cpu {
@@ -517,12 +587,12 @@ pub async fn run(args: Args) -> Result<()> {
     let dtype_name = format!("{dtype:?}");
     info!("Device: {device_name}, dtype: {dtype_name}, streaming: {streaming_enabled}");
 
-    // When `--model` is given, load exactly those (in the given order, so
-    // the first one named becomes the default); otherwise load everything
-    // discovered, in alphabetical order.
+    // When `--model-tts` is given, load exactly those (in the given order,
+    // so the first one named becomes the default); otherwise load
+    // everything discovered, in alphabetical order.
     let models_to_load: Vec<&DiscoveredModel> =
-        engine::model_factory::resolve_models_to_load(&discovered, &args.model)
-            .with_context(|| format!("in '{}'", args.model_path.display()))?;
+        engine::model_factory::resolve_models_to_load(&discovered, &args.model_tts)
+            .with_context(|| format!("in '{}'", tts_dir.display()))?;
 
     // Resolved before model loading so `systemd_listen_fd`'s env-var cleanup
     // (see its doc comment) runs while this process is still single-threaded,
@@ -557,8 +627,8 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let voice_map = VoiceMap::new(&model_names, &runtime);
-    // No ASR models are loaded yet -- `--asr-model-path` is a later addition
-    // -- so this always resolves to an empty map (no ASR models, no default).
+    // No ASR models are loaded yet -- `--model-asr` is a later addition --
+    // so this always resolves to an empty map (no ASR models, no default).
     let asr_map = AsrModelMap::new(&[], &runtime);
     let runtime = Arc::new(runtime);
     let voice_map = Arc::new(voice_map);
@@ -639,6 +709,64 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use wyoming_protocol::client::{Client, ClientError};
     use wyoming_protocol::event::{PingData, SynthesizeData};
+
+    #[test]
+    fn discover_or_empty_missing_dir_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("asr");
+        let result = discover_or_empty(&missing, engine::model_factory::discover_asr_models);
+        assert_eq!(result.unwrap(), vec![]);
+    }
+
+    #[test]
+    fn discover_or_empty_non_directory_propagates_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tts");
+        std::fs::write(&file, "not a directory").unwrap();
+        let result = discover_or_empty(&file, engine::model_factory::discover_models);
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_or_empty_permission_denied_propagates_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let restricted = dir.path().join("restricted");
+        std::fs::create_dir(&restricted).unwrap();
+        let target = restricted.join("tts");
+        std::fs::create_dir(&target).unwrap();
+        // Remove the restricted dir's execute bit so `target` can't be stat'd.
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root ignores permission bits, so skip the assertion in that case
+        // rather than failing under a root-run test suite.
+        let running_as_root = std::fs::metadata(&target).is_ok();
+
+        let result = discover_or_empty(&target, engine::model_factory::discover_models);
+
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !running_as_root {
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn discover_or_empty_existing_dir_delegates_to_discover() {
+        let dir = tempfile::tempdir().unwrap();
+        let tts_dir = dir.path().join("tts");
+        std::fs::create_dir(&tts_dir).unwrap();
+        std::fs::create_dir(tts_dir.join("model")).unwrap();
+        std::fs::write(
+            tts_dir.join("model/config.json"),
+            r#"{"model_type": "qwen3_tts"}"#,
+        )
+        .unwrap();
+
+        let result = discover_or_empty(&tts_dir, engine::model_factory::discover_models).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "model");
+    }
 
     #[test]
     fn parse_size_bare_bytes() {
@@ -995,7 +1123,7 @@ mod tests {
     fn args_with_uri(uri: &str) -> Args {
         Args {
             model_path: PathBuf::from("/nonexistent"),
-            model: vec![],
+            model_tts: vec![],
             list_models: false,
             port: 10200,
             host: "0.0.0.0".into(),
@@ -1005,6 +1133,43 @@ mod tests {
             tts_cache_dir: None,
             tts_cache_max_size: "500M".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn run_bails_when_model_path_missing() {
+        let args = Args {
+            model_path: PathBuf::from("/nonexistent/crane-wyoming-test-path"),
+            ..args_with_uri("tcp://127.0.0.1:0")
+        };
+        let err = run(args).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("/nonexistent/crane-wyoming-test-path")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bails_when_tts_subdir_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = Args {
+            model_path: dir.path().to_path_buf(),
+            ..args_with_uri("tcp://127.0.0.1:0")
+        };
+        let err = run(args).await.unwrap_err();
+        assert!(err.to_string().contains("tts"));
+    }
+
+    #[test]
+    fn print_discovered_models_missing_subdirs_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(print_discovered_models(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn print_discovered_models_non_directory_tts_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tts"), "oops").unwrap();
+        assert!(print_discovered_models(dir.path()).is_err());
     }
 
     #[test]

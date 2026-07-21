@@ -242,9 +242,9 @@ pub fn discover_models(parent_dir: &Path) -> Result<Vec<DiscoveredModel>> {
 /// ASR models.
 ///
 /// Identical to [`discover_models`] except it keeps only ASR model types
-/// (see [`ModelType::is_asr`]), so a `--model-path`/`--asr-model-path` pair
-/// pointed at the same parent directory won't cross-load a TTS model as ASR
-/// or vice versa.
+/// (see [`ModelType::is_asr`]), so pointing this and [`discover_models`] at
+/// the same parent directory (e.g. `<model-path>/tts` and
+/// `<model-path>/asr`) won't cross-load a TTS model as ASR or vice versa.
 ///
 /// # Errors
 ///
@@ -288,8 +288,8 @@ pub fn discover_asr_models(parent_dir: &Path) -> Result<Vec<DiscoveredModel>> {
     Ok(models)
 }
 
-/// Resolve the `--model` names an operator requested against the models
-/// [`discover_models`] found under `--model-path`.
+/// Resolve the `--model-tts` names an operator requested against the models
+/// [`discover_models`] found under `<model-path>/tts`.
 ///
 /// If `requested` is empty, every model in `discovered` is returned (in its
 /// existing, alphabetical order). Otherwise, exactly the named models are
@@ -313,7 +313,7 @@ pub fn resolve_models_to_load<'a>(
     let mut resolved = Vec::with_capacity(requested.len());
     for name in requested {
         if !seen.insert(name.as_str()) {
-            anyhow::bail!("model '{name}' specified more than once in --model");
+            anyhow::bail!("model '{name}' specified more than once in --model-tts");
         }
         let model = discovered.iter().find(|m| &m.name == name).ok_or_else(|| {
             let available: Vec<&str> = discovered.iter().map(|m| m.name.as_str()).collect();

@@ -67,9 +67,9 @@ impl VoiceMap {
     /// Build a voice-to-model mapping from a [`ModelRuntime`].
     ///
     /// `model_names` gives model registration names in priority order
-    /// (typically command-line `--model` order); the first model to claim
-    /// a voice name, or a language, wins. Names not found in `runtime` are
-    /// skipped.
+    /// (typically command-line `--model-tts` order); the first model to
+    /// claim a voice name, or a language, wins. Names not found in
+    /// `runtime` are skipped.
     #[must_use]
     pub fn new(model_names: &[String], runtime: &ModelRuntime) -> Self {
         let mut map = HashMap::new();

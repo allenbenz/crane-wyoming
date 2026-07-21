@@ -670,7 +670,7 @@ impl ModelRuntime {
     /// Returns an arbitrary loaded ASR handle.
     ///
     /// Useful when only one ASR model is loaded (the common case for a
-    /// Wyoming server started with a single `--asr-model-path` flag).
+    /// Wyoming server started with a single `--model-asr` flag).
     #[must_use]
     pub fn default_asr_handle(&self) -> Option<&AsrHandle> {
         self.default_asr

@@ -5,16 +5,19 @@
 #
 # Uncomment and edit the variables you need.
 
-# Required: parent directory containing TTS model subdirectories. All
-# recognized models found there are loaded; the first one (alphabetically)
-# is the default voice when a client does not request one.
+# Required: parent directory containing a tts/ and/or asr/ subdirectory of
+# model subdirectories. All recognized TTS models found under tts/ are
+# loaded; the first one (alphabetically) is the default voice when a
+# client does not request one. A missing tts/ or asr/ subdirectory just
+# means zero models of that family.
 #CRANE_WYOMING_MODEL_PATH=/srv/models
 
-# Optional: restrict which model subdirectories under CRANE_WYOMING_MODEL_PATH
-# are loaded, separated by ';'. Order determines voice priority (first =
-# default). Omit to load every recognized model. Run
-# `crane-wyoming --model-path <dir> --list-models` to see what's available.
-#CRANE_WYOMING_MODEL=Voxtral-4B-TTS-2603;Qwen3-TTS-12Hz-0.6B-Base
+# Optional: restrict which model subdirectories under
+# CRANE_WYOMING_MODEL_PATH/tts are loaded, separated by ';'. Order
+# determines voice priority (first = default). Omit to load every
+# recognized TTS model. Run `crane-wyoming --model-path <dir> --list-models`
+# to see what's available.
+#CRANE_WYOMING_MODEL_TTS=Voxtral-4B-TTS-2603;Qwen3-TTS-12Hz-0.6B-Base
 
 # TCP port to listen on (default: 10200).
 #CRANE_WYOMING_PORT=10200

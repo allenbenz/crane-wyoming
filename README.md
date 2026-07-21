@@ -104,8 +104,8 @@ pip install huggingface_hub
 python3 tools/cw-model-download --list
 ```
 
-Either way, this creates `/srv/models/Voxtral-4B-TTS-2603/`; pass the parent
-directory (`/srv/models`) to `--model-path`.
+Either way, this creates `/srv/models/tts/Voxtral-4B-TTS-2603/`; pass the
+parent directory (`/srv/models`) to `--model-path`.
 
 ## Running the server
 
@@ -113,17 +113,19 @@ directory (`/srv/models`) to `--model-path`.
 ./target/release/crane-wyoming --model-path models --uri unix:///tmp/wyoming.sock
 ```
 
-`--model-path` points at a directory containing one or more model
-subdirectories; every recognized model found there is loaded, with the
-first one (alphabetically) becoming the default voice when a client
-doesn't request one by name. Use `--model <name>` (repeatable) to load only
-specific models, in which case the first one named is the default. Run
-`crane-wyoming --model-path models --list-models` to see which
-subdirectories are recognized and what `--model` expects, without starting
-the server. Use `--uri tcp://host:port` (or plain `--host`/`--port`,
-default `0.0.0.0:10200`) to listen on TCP instead of a Unix socket. See
-`crane-wyoming --help` for the rest of the flags (`--cpu`, `--max-connections`,
-`--tts-cache-dir`/`--tts-cache-max-size`).
+`--model-path` points at a directory containing `tts/` and/or `asr/`
+subdirectories, each holding one or more model subdirectories for that
+family (a missing `tts/` or `asr/` subdirectory just means zero models of
+that family). Every recognized model found under `tts/` is loaded, with
+the first one (alphabetically) becoming the default voice when a client
+doesn't request one by name. Use `--model-tts <name>` (repeatable) to load
+only specific TTS models, in which case the first one named is the
+default. Run `crane-wyoming --model-path models --list-models` to see
+which subdirectories are recognized and what `--model-tts` expects,
+without starting the server. Use `--uri tcp://host:port` (or plain
+`--host`/`--port`, default `0.0.0.0:10200`) to listen on TCP instead of a
+Unix socket. See `crane-wyoming --help` for the rest of the flags (`--cpu`,
+`--max-connections`, `--tts-cache-dir`/`--tts-cache-max-size`).
 
 ### Running as a systemd service
 
