@@ -235,13 +235,14 @@ enum AsrRequest {
 
 /// Handle to an ASR model running on its dedicated thread.
 ///
-/// The input sample rate is queried once at load time, before the model is
-/// moved to its thread, so it can be read without blocking on the
-/// transcription queue.
+/// Cloneable metadata (input sample rate, supported languages) is queried
+/// once at load time, before the model is moved to its thread, so it can be
+/// read without blocking on the transcription queue.
 pub struct AsrHandle {
     tx: mpsc::UnboundedSender<AsrRequest>,
     input_sample_rate: u32,
     model_type_name: &'static str,
+    languages: Vec<String>,
     pending_count: Arc<AtomicU64>,
 }
 
@@ -256,6 +257,13 @@ impl AsrHandle {
     #[must_use]
     pub fn model_type_name(&self) -> &'static str {
         self.model_type_name
+    }
+
+    /// Returns the languages this model claims to support, for service
+    /// discovery only (see [`Asr::supported_languages`]).
+    #[must_use]
+    pub fn languages(&self) -> &[String] {
+        &self.languages
     }
 
     /// Returns the number of requests currently queued or being processed.
@@ -587,9 +595,9 @@ impl ModelRuntime {
 
     /// Register an already-constructed ASR model under `name`.
     ///
-    /// Queries the input sample rate from the model before moving it to a
-    /// dedicated thread. This ordering lets tests inject a mock [`Asr`]
-    /// implementation without touching disk.
+    /// Queries the input sample rate and supported languages from the model
+    /// before moving it to a dedicated thread. This ordering lets tests
+    /// inject a mock [`Asr`] implementation without touching disk.
     ///
     /// See [`register_tts`](Self::register_tts) for why the dedicated
     /// thread runs each request inside
@@ -606,6 +614,7 @@ impl ModelRuntime {
         device: &Device,
     ) -> Result<()> {
         let input_sample_rate = asr.input_sample_rate();
+        let languages = asr.supported_languages();
         let pending_count = Arc::new(AtomicU64::new(0));
 
         let (tx, rx) = mpsc::unbounded_channel::<AsrRequest>();
@@ -631,6 +640,7 @@ impl ModelRuntime {
                 tx,
                 input_sample_rate,
                 model_type_name,
+                languages,
                 pending_count,
             },
         );
@@ -1807,17 +1817,24 @@ mod tests {
 
     struct MockAsr {
         input_sample_rate: u32,
+        languages: Vec<String>,
     }
 
     impl MockAsr {
         fn new() -> Self {
             Self {
                 input_sample_rate: 16000,
+                languages: Vec::new(),
             }
         }
 
         fn with_sample_rate(mut self, sample_rate: u32) -> Self {
             self.input_sample_rate = sample_rate;
+            self
+        }
+
+        fn with_languages(mut self, languages: Vec<String>) -> Self {
+            self.languages = languages;
             self
         }
     }
@@ -1834,6 +1851,10 @@ mod tests {
                 is_final: true,
             })
         }
+
+        fn supported_languages(&self) -> Vec<String> {
+            self.languages.clone()
+        }
     }
 
     #[test]
@@ -1845,6 +1866,29 @@ mod tests {
         assert_eq!(handle.input_sample_rate(), 16000);
         assert_eq!(handle.model_type_name(), "qwen3_asr");
         assert_eq!(handle.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_asr_handle_languages_empty_by_default() {
+        let mut rt = ModelRuntime::new();
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr::new()));
+
+        let handle = rt.asr_handle("m1").unwrap();
+        assert!(handle.languages().is_empty());
+    }
+
+    #[test]
+    fn test_asr_handle_languages_populated() {
+        let mut rt = ModelRuntime::new();
+        register_test_asr(
+            &mut rt,
+            "m1",
+            "qwen3_asr",
+            Box::new(MockAsr::new().with_languages(vec!["en".into(), "zh".into()])),
+        );
+
+        let handle = rt.asr_handle("m1").unwrap();
+        assert_eq!(handle.languages(), &["en".to_string(), "zh".to_string()]);
     }
 
     #[test]
@@ -1961,6 +2005,7 @@ mod tests {
             tx,
             input_sample_rate: 16000,
             model_type_name: "qwen3_asr",
+            languages: Vec::new(),
             pending_count: Arc::new(AtomicU64::new(0)),
         };
 
