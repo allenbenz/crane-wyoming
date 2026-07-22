@@ -143,20 +143,24 @@ impl VoiceMap {
     }
 }
 
-/// Maps ASR model names to model registration names.
+/// Maps ASR model names and languages to model registration names.
 ///
 /// Built once at startup from a [`ModelRuntime`]'s registered ASR models.
-/// Unlike [`VoiceMap`], there is no per-voice granularity and no
-/// language-based lookup: Crane's `Asr` trait reports a detected/used
-/// language only per-transcription result, not as a static per-model
-/// capability list, so a `transcribe` request can only select a model by
-/// its registration name or fall back to the default.
+/// Unlike [`VoiceMap`], there is no per-voice granularity -- ASR models
+/// advertise supported languages directly via [`AsrHandle::languages`]. A
+/// `transcribe` request selects a model by explicit name, by language hint
+/// (matched against the per-model language lists), or falls back to the
+/// default model.
 pub struct AsrModelMap {
     /// Registration names of all configured ASR models that were found in
     /// the runtime.
     model_names: HashSet<String>,
+    /// Lowercased base language subtag (e.g. `"de"` for `"de"` or
+    /// `"de-DE"`) -> model registration name of the first model claiming
+    /// that language.
+    by_language: HashMap<String, String>,
     /// Name of the default ASR model, used when a `transcribe` event
-    /// specifies no model name.
+    /// specifies no model name and no language matching any known model.
     default_model: Option<String>,
 }
 
@@ -168,14 +172,22 @@ impl AsrModelMap {
     #[must_use]
     pub fn new(model_names: &[String], runtime: &ModelRuntime) -> Self {
         let mut found_names = HashSet::new();
+        let mut by_language = HashMap::new();
         for name in model_names {
-            if runtime.asr_handle(name).is_some() {
-                found_names.insert(name.clone());
+            let Some(handle) = runtime.asr_handle(name) else {
+                continue;
+            };
+            found_names.insert(name.clone());
+            for language in handle.languages() {
+                by_language
+                    .entry(base_language_subtag(language))
+                    .or_insert_with(|| name.clone());
             }
         }
         let default_model = runtime.default_asr_name().map(String::from);
         Self {
             model_names: found_names,
+            by_language,
             default_model,
         }
     }
@@ -194,6 +206,16 @@ impl AsrModelMap {
     #[must_use]
     pub fn model_name(&self, name: &str) -> Option<&str> {
         self.model_names.get(name).map(String::as_str)
+    }
+
+    /// Returns the registration name of the first model claiming to
+    /// support `language`, matched on the base language subtag (see
+    /// [`base_language_subtag`]).
+    #[must_use]
+    pub fn model_for_language(&self, language: &str) -> Option<&str> {
+        self.by_language
+            .get(&base_language_subtag(language))
+            .map(String::as_str)
     }
 
     /// Returns the default model's registration name, if any ASR model is loaded.
@@ -270,15 +292,23 @@ enum AsrResolution<'m> {
 
 /// Resolve which ASR model a `transcribe` event should use.
 ///
-/// An explicit model name always wins; otherwise falls back to the default
-/// model. Unlike [`resolve_voice`], there is no language-based resolution
-/// step -- see [`AsrModelMap`]'s doc comment for why.
+/// An explicit model name always wins. Otherwise, if the request names a
+/// language, it is matched against known models' languages -- see
+/// [`AsrModelMap::model_for_language`] -- so e.g. `language: "de"` with no
+/// model name picks a model claiming German instead of silently falling
+/// back to whichever model happens to be the configured default. Only when
+/// neither resolves does the default model apply.
 fn resolve_asr_model<'m>(asr_map: &'m AsrModelMap, data: &TranscribeData) -> AsrResolution<'m> {
     if let Some(name) = data.name.as_deref() {
         return match asr_map.model_name(name) {
             Some(model_name) => AsrResolution::Found(model_name),
             None => AsrResolution::NotFound(name.to_string()),
         };
+    }
+    if let Some(language) = data.language.as_deref()
+        && let Some(model_name) = asr_map.model_for_language(language)
+    {
+        return AsrResolution::Found(model_name);
     }
     match asr_map.default_model() {
         Some(model_name) => AsrResolution::Found(model_name),
@@ -2395,6 +2425,33 @@ mod tests {
         }
     }
 
+    /// An ASR model that claims to support a fixed set of languages, for
+    /// testing [`AsrModelMap`]'s language-based resolution. `tag` is
+    /// embedded in the transcript text so tests can tell which model
+    /// instance actually handled a request.
+    struct MockAsrWithLanguages {
+        tag: &'static str,
+        languages: Vec<&'static str>,
+    }
+
+    impl Asr for MockAsrWithLanguages {
+        fn input_sample_rate(&self) -> u32 {
+            16000
+        }
+
+        fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOptions) -> Result<Transcript> {
+            Ok(Transcript {
+                text: format!("{}: heard {} samples", self.tag, audio.len()),
+                language: opts.language.clone(),
+                is_final: true,
+            })
+        }
+
+        fn supported_languages(&self) -> Vec<String> {
+            self.languages.iter().map(|s| (*s).to_string()).collect()
+        }
+    }
+
     struct FailingAsr;
 
     impl Asr for FailingAsr {
@@ -2542,6 +2599,54 @@ mod tests {
         assert!(!am.has_model("ghost"));
     }
 
+    #[test]
+    fn test_asr_model_map_language_lookup() {
+        let mut rt = test_runtime();
+        register_test_asr(
+            &mut rt,
+            "m1",
+            "qwen3_asr",
+            Box::new(MockAsrWithLanguages {
+                tag: "m1",
+                languages: vec!["de", "en"],
+            }),
+        );
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        assert_eq!(am.model_for_language("de"), Some("m1"));
+        // Matching is on the base subtag only, case-insensitively, and
+        // accepts both `-` and `_` as the subtag separator.
+        assert_eq!(am.model_for_language("DE-DE"), Some("m1"));
+        assert_eq!(am.model_for_language("de_DE"), Some("m1"));
+        assert_eq!(am.model_for_language("fr"), None);
+    }
+
+    #[test]
+    fn test_asr_model_map_language_first_model_wins() {
+        let mut rt = test_runtime();
+        register_test_asr(
+            &mut rt,
+            "first",
+            "qwen3_asr",
+            Box::new(MockAsrWithLanguages {
+                tag: "first",
+                languages: vec!["de"],
+            }),
+        );
+        register_test_asr(
+            &mut rt,
+            "second",
+            "qwen3_asr",
+            Box::new(MockAsrWithLanguages {
+                tag: "second",
+                languages: vec!["de"],
+            }),
+        );
+
+        let am = AsrModelMap::new(&["first".to_string(), "second".to_string()], &rt);
+        assert_eq!(am.model_for_language("de"), Some("first"));
+    }
+
     /// 16kHz mono 16-bit PCM format, matching `MockAsr::input_sample_rate`.
     fn mock_asr_format() -> AudioFormat {
         AudioFormat {
@@ -2642,6 +2747,156 @@ mod tests {
             results,
             vec![Event::Transcript(
                 TranscriptData::new("heard 1 samples").with_language("de")
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_language_selects_model() {
+        // "default" is registered first (making it the runtime's default)
+        // and would fail if selected, so a passing test proves the "de"
+        // language hint actually routed to "german" instead of falling
+        // through to the default.
+        let mut rt = test_runtime();
+        rt.set_streaming_enabled(false);
+        register_test_asr(&mut rt, "default", "qwen3_asr", Box::new(FailingAsr));
+        register_test_asr(
+            &mut rt,
+            "german",
+            "qwen3_asr",
+            Box::new(MockAsrWithLanguages {
+                tag: "german",
+                languages: vec!["de"],
+            }),
+        );
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["default".to_string(), "german".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new().with_language("de")),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 1]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            results,
+            vec![Event::Transcript(
+                TranscriptData::new("german: heard 1 samples").with_language("de")
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_name_overrides_language() {
+        // "german" claims "de" but is requested by an explicit name that
+        // doesn't match its language, while "named" is requested by name
+        // and claims no language at all. The explicit name must win.
+        let mut rt = test_runtime();
+        rt.set_streaming_enabled(false);
+        register_test_asr(
+            &mut rt,
+            "german",
+            "qwen3_asr",
+            Box::new(MockAsrWithLanguages {
+                tag: "german",
+                languages: vec!["de"],
+            }),
+        );
+        register_test_asr(
+            &mut rt,
+            "named",
+            "qwen3_asr",
+            Box::new(MockAsrWithLanguages {
+                tag: "named",
+                languages: vec![],
+            }),
+        );
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["german".to_string(), "named".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new().with_name("named").with_language("de")),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 1]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            results,
+            vec![Event::Transcript(
+                TranscriptData::new("named: heard 1 samples").with_language("de")
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_unmatched_language_falls_back_to_default() {
+        // "default" is registered first (making it the runtime's default)
+        // and claims "en", while "german" claims "de". Neither matches the
+        // requested "fr", so this must fall back to "default" rather than
+        // erroneously picking "german".
+        let mut rt = test_runtime();
+        rt.set_streaming_enabled(false);
+        register_test_asr(
+            &mut rt,
+            "default",
+            "qwen3_asr",
+            Box::new(MockAsrWithLanguages {
+                tag: "default",
+                languages: vec!["en"],
+            }),
+        );
+        register_test_asr(
+            &mut rt,
+            "german",
+            "qwen3_asr",
+            Box::new(MockAsrWithLanguages {
+                tag: "german",
+                languages: vec!["de"],
+            }),
+        );
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["default".to_string(), "german".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new().with_language("fr")),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 1]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            results,
+            vec![Event::Transcript(
+                TranscriptData::new("default: heard 1 samples").with_language("fr")
             )]
         );
     }
