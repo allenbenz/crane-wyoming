@@ -179,11 +179,67 @@ impl SynthesizeData {
     }
 }
 
+/// How quickly the end of a voice command is detected.
+///
+/// Sent by the client in the `transcribe` event's `vad_sensitivity`
+/// field. See the upstream Wyoming schema (`wyoming/asr.py`,
+/// `VadSensitivity`).
+///
+/// [`VadSensitivity::Other`] preserves unrecognized values for forward
+/// compatibility, mirroring how [`Event::Unknown`] handles unrecognized
+/// event types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VadSensitivity {
+    /// Balanced end-of-command detection.
+    Default,
+    /// Tolerates longer pauses before ending a command.
+    Relaxed,
+    /// Ends a command as soon as possible after speech stops.
+    Aggressive,
+    /// An unrecognized sensitivity value, preserved as-is.
+    Other(String),
+}
+
+impl VadSensitivity {
+    /// Returns the wire-format string for this sensitivity level.
+    fn as_wire_str(&self) -> &str {
+        match self {
+            VadSensitivity::Default => "default",
+            VadSensitivity::Relaxed => "relaxed",
+            VadSensitivity::Aggressive => "aggressive",
+            VadSensitivity::Other(value) => value,
+        }
+    }
+}
+
+impl Serialize for VadSensitivity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for VadSensitivity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "default" => VadSensitivity::Default,
+            "relaxed" => VadSensitivity::Relaxed,
+            "aggressive" => VadSensitivity::Aggressive,
+            _ => VadSensitivity::Other(value),
+        })
+    }
+}
+
 /// Data for a `transcribe` event (ASR request).
 ///
-/// `context` and `vad_sensitivity` from the upstream Wyoming schema are
-/// not yet modeled; extend this struct when ASR context/VAD support
-/// lands.
+/// `context` from the upstream Wyoming schema is not yet modeled;
+/// extend this struct when ASR context support lands.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct TranscribeData {
@@ -193,6 +249,9 @@ pub struct TranscribeData {
     /// Language hint for transcription.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// How quickly the end of a voice command is detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vad_sensitivity: Option<VadSensitivity>,
 }
 
 impl TranscribeData {
@@ -213,6 +272,13 @@ impl TranscribeData {
     #[must_use]
     pub fn with_language(mut self, language: impl Into<String>) -> Self {
         self.language = Some(language.into());
+        self
+    }
+
+    /// Sets the VAD sensitivity for this transcription request.
+    #[must_use]
+    pub fn with_vad_sensitivity(mut self, sensitivity: VadSensitivity) -> Self {
+        self.vad_sensitivity = Some(sensitivity);
         self
     }
 }
@@ -736,6 +802,7 @@ mod tests {
         let event = Event::Transcribe(TranscribeData {
             name: Some("Qwen3-ASR".to_string()),
             language: Some("en".to_string()),
+            vad_sensitivity: None,
         });
         assert_eq!(round_trip(&event), event);
     }
@@ -751,12 +818,67 @@ mod tests {
         let event = Event::Transcribe(TranscribeData {
             name: Some("Qwen3-ASR".to_string()),
             language: None,
+            vad_sensitivity: None,
         });
         assert_eq!(round_trip(&event), event);
         let bytes = event.serialize_data().unwrap().unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("name"));
         assert!(!text.contains("language"));
+    }
+
+    #[test]
+    fn test_transcribe_with_vad_sensitivity() {
+        let event = Event::Transcribe(TranscribeData {
+            name: Some("Qwen3-ASR".to_string()),
+            language: Some("en".to_string()),
+            vad_sensitivity: Some(VadSensitivity::Aggressive),
+        });
+        assert_eq!(round_trip(&event), event);
+    }
+
+    #[test]
+    fn test_transcribe_vad_sensitivity_only() {
+        let event =
+            Event::Transcribe(TranscribeData::new().with_vad_sensitivity(VadSensitivity::Relaxed));
+        assert_eq!(round_trip(&event), event);
+        let bytes = event.serialize_data().unwrap().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("vad_sensitivity"));
+        assert!(!text.contains("name"));
+        assert!(!text.contains("language"));
+    }
+
+    #[test]
+    fn test_vad_sensitivity_wire_values() {
+        let cases = [
+            (VadSensitivity::Default, "\"default\""),
+            (VadSensitivity::Relaxed, "\"relaxed\""),
+            (VadSensitivity::Aggressive, "\"aggressive\""),
+        ];
+        for (sensitivity, expected) in cases {
+            let event =
+                Event::Transcribe(TranscribeData::new().with_vad_sensitivity(sensitivity.clone()));
+            let bytes = event.serialize_data().unwrap().unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(
+                text.contains(expected),
+                "expected {expected} in {text}, got sensitivity {sensitivity:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_transcribe_unknown_vad_sensitivity_preserved() {
+        let data = json!({"vad_sensitivity": "unknown"});
+        let event = Event::from_wire(TYPE_TRANSCRIBE, data, None).unwrap();
+        let Event::Transcribe(transcribe) = event else {
+            panic!("expected Event::Transcribe");
+        };
+        assert_eq!(
+            transcribe.vad_sensitivity,
+            Some(VadSensitivity::Other("unknown".to_string()))
+        );
     }
 
     #[test]
