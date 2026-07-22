@@ -1157,8 +1157,8 @@ fn crane_attribution() -> serde_json::Value {
 ///
 /// Each ASR model becomes an `AsrProgram`-shaped JSON value, similarly
 /// named after its registration name and skipped if not part of
-/// `asr_map`'s configured set. `languages` is always empty for now -- see
-/// "Language support (or the current lack of it)" in `ASR.md`.
+/// `asr_map`'s configured set. `languages` comes from the model's
+/// [`AsrHandle::languages`] (i.e. `Asr::supported_languages()`).
 fn build_info(runtime: &ModelRuntime, voice_map: &VoiceMap, asr_map: &AsrModelMap) -> InfoData {
     let streaming_enabled = runtime.streaming_enabled();
     let mut models: Vec<(&str, &TtsHandle)> = runtime.tts_handles().collect();
@@ -1221,12 +1221,12 @@ fn build_info(runtime: &ModelRuntime, voice_map: &VoiceMap, asr_map: &AsrModelMa
             }
             configured
         })
-        .map(|(model_name, _handle)| {
+        .map(|(model_name, handle)| {
             serde_json::json!({
                 "name": model_name,
                 "models": [{
                     "name": model_name,
-                    "languages": Vec::<String>::new(),
+                    "languages": handle.languages(),
                     "attribution": crane_attribution(),
                     "installed": true,
                 }],
@@ -2166,6 +2166,32 @@ mod tests {
                 assert_eq!(models.len(), 1);
                 assert_eq!(models[0]["name"], "m1");
                 assert_eq!(models[0]["languages"], serde_json::json!([]));
+            },
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_asr_model_languages_populated() {
+        let mut rt = test_runtime();
+        register_test_asr(
+            &mut rt,
+            "m1",
+            "qwen3_asr",
+            Box::new(MockAsrWithLanguages {
+                tag: "m1",
+                languages: vec!["de", "en"],
+            }),
+        );
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(&rt, &vm, &am, vec![Event::Describe]).await;
+
+        match &results[0] {
+            Event::Info(data) => {
+                let models = data.asr[0]["models"].as_array().unwrap();
+                assert_eq!(models[0]["languages"], serde_json::json!(["de", "en"]));
             },
             other => panic!("expected Info, got {other:?}"),
         }
