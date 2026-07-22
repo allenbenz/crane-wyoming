@@ -49,10 +49,12 @@ It provides the following three executables:
 * [x] Wyoming Protocol Crate
 * [x] Text-To-Speech (TTS) Support
 * [x] Commandline Client
-+ [x] Speech Dispatcher Support
-+ [ ] Automatic Speech Recognition (ASR)
-+ [ ] Voice Activity Detection (VAD)
-+ [ ] OpenWakeWord Support
+* [x] Speech Dispatcher Support
+* [x] Automatic Speech Recognition (ASR)
+* [ ] Voice Activity Detection (VAD)
+* [ ] OpenWakeWord Support
+* [ ] Support for Kokoro Voices
+* [ ] Support for Piper Voices
 
 ## Building
 
