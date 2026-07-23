@@ -19,8 +19,8 @@
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
@@ -30,6 +30,8 @@ use crane::audio::AudioInfo;
 use crane::audio::tts::{Tts, VoiceInfo};
 use crane::audio::{Asr, TranscribeOptions, Transcript};
 use crane_core::generation::SpeechOptions;
+use crane_core::models::silero_vad::Vad;
+use wyoming_protocol::event::VadSensitivity;
 
 use crate::engine::cache::{CacheKey, TtsCache};
 use crate::engine::model_factory::{self, ModelType};
@@ -314,6 +316,18 @@ pub struct ModelRuntime {
     streaming_enabled: bool,
     asr: HashMap<String, AsrHandle>,
     default_asr: Option<String>,
+    /// Loaded Silero VAD model for ASR pre-filtering, if one was found
+    /// under `<model-path>/vad/` at startup. `None` means VAD filtering is
+    /// unavailable, the same "zero models of that family" pattern already
+    /// used by `asr`/`tts`. Guarded by a `Mutex` rather than given its own
+    /// dedicated thread: filtering is a one-shot call per transcription
+    /// request, not a long-lived stream, so a `Mutex` is simpler than the
+    /// channel-based dispatch TTS/ASR use. The `Arc` lets
+    /// [`vad_filter_audio`](Self::vad_filter_audio) move the model into
+    /// [`spawn_blocking`](tokio::task::spawn_blocking), which is required
+    /// since inference runs synchronously and must not block a tokio
+    /// worker thread.
+    vad: Option<Arc<Mutex<Vad>>>,
 }
 
 impl Default for ModelRuntime {
@@ -333,6 +347,7 @@ impl ModelRuntime {
             streaming_enabled: true,
             asr: HashMap::new(),
             default_asr: None,
+            vad: None,
         }
     }
 
@@ -750,6 +765,78 @@ impl ModelRuntime {
         })?;
         Ok(chunk_rx)
     }
+
+    /// Register a loaded Silero VAD model for ASR pre-filtering.
+    ///
+    /// Unlike TTS/ASR, there's no `load_vad`/`register_vad` pair spawning a
+    /// dedicated thread -- only one VAD model is supported, and filtering
+    /// is a one-shot call per transcription rather than a long-lived
+    /// stream, so the caller constructs and loads the model directly (see
+    /// [`vad_filter_audio`](Self::vad_filter_audio)) and hands it here.
+    pub fn set_vad(&mut self, vad: Vad) {
+        self.vad = Some(Arc::new(Mutex::new(vad)));
+    }
+
+    /// Filters `audio` through the loaded Silero VAD model, returning only
+    /// the detected speech regions concatenated in their original order.
+    ///
+    /// Returns an error if no VAD model was found under `<model-path>/vad/`
+    /// at startup; unlike [`default_asr_handle`](Self::default_asr_handle)'s
+    /// `Option`-based "zero models" convention, the caller is expected to
+    /// treat "no VAD loaded" as its own case (e.g. skip filtering and
+    /// dispatch audio to ASR unfiltered) rather than have that decision
+    /// made here. Concurrent calls serialize on an internal `Mutex`.
+    ///
+    /// Inference runs synchronously, so the call is dispatched through
+    /// [`spawn_blocking`](tokio::task::spawn_blocking) rather than run
+    /// directly on the calling task, so it can't stall a tokio worker
+    /// thread. Within that blocking task, the call is wrapped in
+    /// [`catch_unwind`](std::panic::catch_unwind) so a panic inside VAD
+    /// segmentation can't leave the `Mutex` poisoned for later requests,
+    /// matching the panic-recovery convention used by TTS/ASR generation
+    /// (see [`handle_generate_request`], [`handle_transcribe_request`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no VAD model is loaded, if the blocking task
+    /// itself panics or is cancelled, or if VAD
+    /// segmentation/configuration fails or panics.
+    // Not yet called: `handle_transcribe` doesn't dispatch through VAD
+    // pre-filtering yet, pending VAD model loading being wired into
+    // `lib.rs` in a follow-up commit.
+    #[allow(dead_code)]
+    pub(crate) async fn vad_filter_audio(
+        &self,
+        audio: Vec<f32>,
+        sensitivity: Option<VadSensitivity>,
+    ) -> Result<Vec<f32>> {
+        let vad = Arc::clone(
+            self.vad
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no VAD model loaded"))?,
+        );
+
+        tokio::task::spawn_blocking(move || {
+            let mut vad = vad
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                vad_filter_audio_impl(&mut vad, audio, sensitivity.as_ref())
+            }));
+
+            match panic_result {
+                Ok(result) => result,
+                Err(panic_payload) => {
+                    let msg = panic_message(&*panic_payload);
+                    tracing::error!(panic = %msg, "VAD filtering panicked");
+                    Err(anyhow::anyhow!("VAD filtering panicked: {msg}"))
+                },
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("VAD filtering task failed: {e}"))?
+    }
 }
 
 /// Derive a registration name from a model path's final path component.
@@ -1041,10 +1128,123 @@ fn handle_stream_transcribe_request(asr: &mut dyn Asr, req: AsrStreamRequest, mo
     }
 }
 
+/// Speech detection threshold for `VadSensitivity::Aggressive`.
+const AGGRESSIVE_THRESHOLD: f32 = 0.6;
+/// Minimum silence gap (ms) before speech is considered ended, for
+/// `VadSensitivity::Aggressive`.
+const AGGRESSIVE_MIN_SILENCE_MS: usize = 250;
+
+/// Speech detection threshold for `VadSensitivity::Default` (and any
+/// unrecognized/forward-compatibility value).
+const DEFAULT_THRESHOLD: f32 = 0.5;
+/// Minimum silence gap (ms) for `VadSensitivity::Default`.
+const DEFAULT_MIN_SILENCE_MS: usize = 400;
+
+/// Speech detection threshold for `VadSensitivity::Relaxed`.
+const RELAXED_THRESHOLD: f32 = 0.4;
+/// Minimum silence gap (ms) for `VadSensitivity::Relaxed`.
+const RELAXED_MIN_SILENCE_MS: usize = 600;
+
+/// Maps a Wyoming `transcribe` event's `vad_sensitivity` field to the
+/// Silero `VadConfig` parameters that control how quickly the end of
+/// speech is detected.
+///
+/// `aggressive` raises the detection threshold and shortens the silence
+/// window for a quick cutoff; `relaxed` lowers the threshold and extends
+/// the window to tolerate longer pauses. `default`, `None`, and any
+/// unrecognized value (`VadSensitivity::Other`, forward-compatibility for
+/// values Wyoming may define later) share the same balanced settings,
+/// matching Wyoming's convention that unsupported optional values are
+/// silently ignored rather than rejected.
+///
+/// Returns `(threshold, min_silence_ms)`.
+fn sensitivity_params(sensitivity: Option<&VadSensitivity>) -> (f32, usize) {
+    match sensitivity {
+        Some(VadSensitivity::Aggressive) => (AGGRESSIVE_THRESHOLD, AGGRESSIVE_MIN_SILENCE_MS),
+        Some(VadSensitivity::Relaxed) => (RELAXED_THRESHOLD, RELAXED_MIN_SILENCE_MS),
+        Some(VadSensitivity::Default | VadSensitivity::Other(_)) | None => {
+            (DEFAULT_THRESHOLD, DEFAULT_MIN_SILENCE_MS)
+        },
+    }
+}
+
+/// Runs Silero VAD over `audio` and returns only the detected speech
+/// regions, concatenated in their original order.
+///
+/// Updates `vad`'s config from `sensitivity` (see [`sensitivity_params`]),
+/// applies it, and resets any state left over from a previous call before
+/// segmenting -- callers sharing one `Vad` (see
+/// [`ModelRuntime::vad_filter_audio`]) must serialize calls. If no speech
+/// segments are found (e.g. the recording is all silence), `audio` is
+/// returned unchanged rather than an empty vector, so the ASR model can
+/// still produce a (likely empty) transcript instead of the request
+/// silently vanishing.
+///
+/// Callers on a CPU-bound path must wrap this call in
+/// [`with_context`](candle_core::Device::with_context) themselves, same as
+/// every other CPU model dispatch in this module -- `Vad` does not do this
+/// internally.
+///
+/// # Errors
+///
+/// Returns an error if applying the sensitivity config or segmenting the
+/// audio fails (e.g. no model was loaded via `Vad::load`).
+fn vad_filter_audio_impl(
+    vad: &mut Vad,
+    audio: Vec<f32>,
+    sensitivity: Option<&VadSensitivity>,
+) -> Result<Vec<f32>> {
+    let (threshold, min_silence) = sensitivity_params(sensitivity);
+    vad.config.threshold = threshold;
+    vad.config.min_silence = min_silence;
+    vad.apply_config()?;
+    vad.reset()?;
+
+    vad.segment_audio(&audio)?;
+    let segments = vad.flush()?;
+
+    if segments.is_empty() {
+        tracing::info!(
+            original_len = audio.len(),
+            "VAD: no speech detected, passing audio through unfiltered",
+        );
+        return Ok(audio);
+    }
+
+    let capacity = segments
+        .iter()
+        .map(|&(start, end)| end.saturating_sub(start))
+        .sum();
+    let mut filtered = Vec::with_capacity(capacity);
+    for &(start, end) in segments {
+        match audio.get(start..end) {
+            Some(slice) => filtered.extend_from_slice(slice),
+            None => {
+                tracing::warn!(
+                    start,
+                    end,
+                    audio_len = audio.len(),
+                    "VAD: segment out of bounds, skipping",
+                );
+            },
+        }
+    }
+
+    tracing::info!(
+        original_len = audio.len(),
+        filtered_len = filtered.len(),
+        segments = segments.len(),
+        "VAD: filtered audio to speech regions",
+    );
+
+    Ok(filtered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_core::Device;
+    use crane_core::models::silero_vad::VadConfig;
     use std::fs;
 
     /// Registers `tts` on `Device::Cpu` -- the device is irrelevant to these
@@ -2352,5 +2552,58 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap().text, "ok");
         assert!(rx2.blocking_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_vad_filter_audio_no_model_loaded_on_runtime() {
+        let rt = ModelRuntime::new();
+        let result = rt.vad_filter_audio(vec![0.0f32; 1024], None).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no VAD model loaded")
+        );
+    }
+
+    #[test]
+    fn test_sensitivity_params_mapping() {
+        assert_eq!(
+            sensitivity_params(Some(&VadSensitivity::Aggressive)),
+            (0.6, 250)
+        );
+        assert_eq!(
+            sensitivity_params(Some(&VadSensitivity::Relaxed)),
+            (0.4, 600)
+        );
+        assert_eq!(
+            sensitivity_params(Some(&VadSensitivity::Default)),
+            (0.5, 400)
+        );
+        assert_eq!(
+            sensitivity_params(Some(&VadSensitivity::Other("unknown".into()))),
+            (0.5, 400)
+        );
+        assert_eq!(sensitivity_params(None), (0.5, 400));
+    }
+
+    #[tokio::test]
+    async fn test_vad_filter_audio_empty_audio_passthrough() {
+        let mut rt = ModelRuntime::new();
+        rt.set_vad(Vad::new(VadConfig::default()).unwrap());
+        let result = rt.vad_filter_audio(vec![], None).await.unwrap();
+        assert_eq!(result, Vec::<f32>::new());
+    }
+
+    #[tokio::test]
+    async fn test_vad_filter_audio_errors_without_onnx_model_loaded() {
+        // `set_vad` is given a `Vad` with no `Vad::load()` call: any audio
+        // long enough to reach inference must surface the missing-model
+        // error rather than panicking.
+        let mut rt = ModelRuntime::new();
+        rt.set_vad(Vad::new(VadConfig::default()).unwrap());
+        let result = rt.vad_filter_audio(vec![0.0f32; 1024], None).await;
+        assert!(result.is_err());
     }
 }

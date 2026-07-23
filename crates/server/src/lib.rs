@@ -31,20 +31,21 @@ use clap::Parser;
 use tracing::{info, warn};
 
 use crate::engine::ModelRuntime;
-use crate::engine::model_factory::DiscoveredModel;
+use crate::engine::model_factory::{DiscoveredModel, DiscoveredVadModel};
 
 /// Command-line arguments for the Wyoming protocol TTS/ASR server.
 #[derive(Parser, Debug, Clone)]
 #[command(about = "Wyoming protocol TTS/ASR server for Home Assistant voice integration")]
 pub struct Args {
-    /// Parent directory containing a `tts/` and/or `asr/` subdirectory,
-    /// each holding model subdirectories for that family. All recognized
-    /// models found as immediate subdirectories of `tts/` are loaded,
-    /// unless restricted with `--model-tts`. The first loaded TTS model
-    /// (alphabetically, or by `--model-tts` order if given) becomes the
-    /// default voice when a client does not request one by name. A missing
-    /// `tts/` or `asr/` subdirectory means zero models of that family, not
-    /// an error.
+    /// Parent directory containing `tts/`, `asr/`, and/or `vad/`
+    /// subdirectories. `tts/` and `asr/` each hold model subdirectories for
+    /// that family; `vad/` holds a single Silero VAD model directory
+    /// containing `model.onnx`. All recognized models found as immediate
+    /// subdirectories of `tts/` are loaded, unless restricted with
+    /// `--model-tts`. The first loaded TTS model (alphabetically, or by
+    /// `--model-tts` order if given) becomes the default voice when a
+    /// client does not request one by name. A missing `tts/`, `asr/`, or
+    /// `vad/` subdirectory means zero models of that family, not an error.
     #[arg(
         short = 'm',
         long = "model-path",
@@ -97,6 +98,12 @@ pub struct Args {
     /// Force CPU-only inference (disables CUDA/Metal auto-detection).
     #[arg(long, env = "CRANE_WYOMING_CPU")]
     pub cpu: bool,
+
+    /// Disable VAD pre-filtering on ASR input, even when a VAD model is
+    /// loaded under `<model-path>/vad/`. Has no effect if no VAD model was
+    /// found.
+    #[arg(long, env = "CRANE_WYOMING_NO_VAD_FILTER")]
+    pub no_vad_filter: bool,
 
     /// Maximum number of concurrent client connections.
     #[arg(long, default_value_t = 16, env = "CRANE_WYOMING_MAX_CONNECTIONS")]
@@ -452,6 +459,8 @@ async fn serve_connection(
 const TTS_SUBDIR: &str = "tts";
 /// Directory name, under `--model-path`, holding ASR model subdirectories.
 const ASR_SUBDIR: &str = "asr";
+/// Directory name, under `--model-path`, holding a VAD model subdirectory.
+const VAD_SUBDIR: &str = "vad";
 
 /// Scan `dir` for models with `discover`, treating a *missing* `dir` as
 /// "zero models" rather than an error.
@@ -477,6 +486,21 @@ fn discover_or_empty(
     }
 }
 
+/// Scan `dir` for a VAD model with [`discover_vad_model`], treating a
+/// *missing* `dir` as "no VAD model" rather than an error. See
+/// [`discover_or_empty`], which does the same for TTS/ASR.
+///
+/// # Errors
+///
+/// Returns an error if `dir` exists but cannot be scanned for a model.
+fn discover_vad_or_none(dir: &std::path::Path) -> Result<Option<DiscoveredVadModel>> {
+    match std::fs::metadata(dir) {
+        Ok(_) => engine::model_factory::discover_vad_model(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("cannot access '{}'", dir.display())),
+    }
+}
+
 /// Print the TTS and ASR models found under `<model_path>/tts` and
 /// `<model_path>/asr`, for `--list-models`.
 ///
@@ -492,8 +516,9 @@ fn print_discovered_models(model_path: &std::path::Path) -> Result<()> {
         &model_path.join(ASR_SUBDIR),
         engine::model_factory::discover_asr_models,
     )?;
+    let vad = discover_vad_or_none(&model_path.join(VAD_SUBDIR))?;
 
-    if tts.is_empty() && asr.is_empty() {
+    if tts.is_empty() && asr.is_empty() && vad.is_none() {
         println!("No supported models found in '{}'", model_path.display());
         return Ok(());
     }
@@ -501,6 +526,12 @@ fn print_discovered_models(model_path: &std::path::Path) -> Result<()> {
     print_model_group("TTS models:", &tts);
     println!();
     print_model_group("ASR models:", &asr);
+    println!();
+    println!("VAD model:");
+    match &vad {
+        Some(v) => println!("  {}", v.name),
+        None => println!("  (none)"),
+    }
 
     Ok(())
 }
@@ -515,6 +546,47 @@ fn print_model_group(header: &str, models: &[DiscoveredModel]) {
     if models.is_empty() {
         println!("  (none)");
     }
+}
+
+/// Load `vad_model`'s `model.onnx` into `runtime` for ASR pre-filtering,
+/// unless `no_vad_filter` is set. Returns whether a VAD model ended up
+/// loaded (`false` if `vad_model` is `None` or `no_vad_filter` is set).
+///
+/// VAD always runs on CPU: the Silero model is tiny (~2 MB) and fast
+/// enough that CPU inference adds negligible latency, avoiding competing
+/// for GPU memory with TTS/ASR models.
+///
+/// # Errors
+///
+/// Returns an error if the ONNX model file fails to load.
+fn load_vad_model(
+    runtime: &mut ModelRuntime,
+    vad_model: Option<&DiscoveredVadModel>,
+    no_vad_filter: bool,
+) -> Result<bool> {
+    let Some(vad_model) = vad_model else {
+        return Ok(false);
+    };
+    if no_vad_filter {
+        info!(
+            name = %vad_model.name,
+            "VAD model found but --no-vad-filter is set; skipping",
+        );
+        return Ok(false);
+    }
+
+    let onnx_path = vad_model.path.join("model.onnx");
+    let onnx_str = onnx_path.to_string_lossy();
+    let mut vad =
+        crane_core::models::silero_vad::Vad::new(crane_core::models::silero_vad::VadConfig {
+            use_cpu: true,
+            ..crane_core::models::silero_vad::VadConfig::default()
+        })?;
+    vad.load(&*onnx_str)
+        .with_context(|| format!("loading VAD model '{onnx_str}'"))?;
+    runtime.set_vad(vad);
+    info!(name = %vad_model.name, path = %onnx_str, "VAD model loaded");
+    Ok(true)
 }
 
 /// Resolve the compute device and floating-point dtype to load models with,
@@ -562,15 +634,17 @@ fn resolve_device_and_dtype(
 /// Run the Wyoming protocol TTS/ASR server.
 ///
 /// Discovers TTS models under `<model-path>/tts` (optionally restricted by
-/// `--model-tts`) and ASR models under `<model-path>/asr` (optionally
-/// restricted by `--model-asr`). If `--list-models` is set, prints the
-/// discovered models and returns without starting the server. Otherwise
-/// loads them into a shared [`ModelRuntime`], optionally enables the
-/// on-disk TTS cache, then accepts connections on the address resolved
-/// from `--uri` (or `args.host`:`args.port` if unset) -- either TCP or a
-/// Unix domain socket. Each connection is handled on its own tokio task
-/// via [`handle_connection`]; TTS/ASR requests from all connections queue
-/// on the target model's dedicated thread and are processed one at a time.
+/// `--model-tts`), ASR models under `<model-path>/asr` (optionally
+/// restricted by `--model-asr`), and an optional VAD model under
+/// `<model-path>/vad` (used for ASR pre-filtering unless `--no-vad-filter`
+/// is set). If `--list-models` is set, prints the discovered models and
+/// returns without starting the server. Otherwise loads them into a
+/// shared [`ModelRuntime`], optionally enables the on-disk TTS cache, then
+/// accepts connections on the address resolved from `--uri` (or
+/// `args.host`:`args.port` if unset) -- either TCP or a Unix domain
+/// socket. Each connection is handled on its own tokio task via
+/// [`handle_connection`]; TTS/ASR requests from all connections queue on
+/// the target model's dedicated thread and are processed one at a time.
 ///
 /// # Errors
 ///
@@ -601,6 +675,9 @@ pub async fn run(args: Args) -> Result<()> {
 
     let asr_dir = args.model_path.join(ASR_SUBDIR);
     let asr_discovered = discover_or_empty(&asr_dir, engine::model_factory::discover_asr_models)?;
+
+    let vad_dir = args.model_path.join(VAD_SUBDIR);
+    let vad_discovered = discover_vad_or_none(&vad_dir)?;
 
     if tts_discovered.is_empty() && asr_discovered.is_empty() {
         anyhow::bail!(
@@ -674,6 +751,8 @@ pub async fn run(args: Args) -> Result<()> {
         asr_model_names.push(name);
     }
 
+    let vad_loaded = load_vad_model(&mut runtime, vad_discovered.as_ref(), args.no_vad_filter)?;
+
     let voice_map = VoiceMap::new(&model_names, &runtime);
     let asr_map = AsrModelMap::new(&asr_model_names, &runtime);
     let runtime = Arc::new(runtime);
@@ -685,6 +764,7 @@ pub async fn run(args: Args) -> Result<()> {
         listen = %listener.display_addr(),
         tts_models = model_names.len(),
         asr_models = asr_model_names.len(),
+        vad = vad_loaded,
         "crane-wyoming ready"
     );
 
@@ -1177,6 +1257,7 @@ mod tests {
             host: "0.0.0.0".into(),
             uri: Some(uri.to_string()),
             cpu: false,
+            no_vad_filter: false,
             max_connections: 16,
             tts_cache_dir: None,
             tts_cache_max_size: "500M".into(),
@@ -1245,6 +1326,66 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("tts"), "oops").unwrap();
         assert!(print_discovered_models(dir.path()).is_err());
+    }
+
+    #[test]
+    fn discover_vad_or_none_missing_dir_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(discover_vad_or_none(&dir.path().join("vad")).unwrap(), None);
+    }
+
+    #[test]
+    fn discover_vad_or_none_finds_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let vad_dir = dir.path().join("vad").join("silero-vad");
+        std::fs::create_dir_all(&vad_dir).unwrap();
+        std::fs::write(vad_dir.join("model.onnx"), b"").unwrap();
+
+        let result = discover_vad_or_none(&dir.path().join("vad"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.name, "silero-vad");
+    }
+
+    #[test]
+    fn load_vad_model_no_model_is_noop() {
+        let mut rt = test_runtime();
+        let loaded = load_vad_model(&mut rt, None, false).unwrap();
+        assert!(!loaded);
+    }
+
+    #[test]
+    fn load_vad_model_skipped_when_no_vad_filter_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let vad_model = DiscoveredVadModel {
+            path: dir.path().to_path_buf(),
+            name: "silero-vad".into(),
+        };
+        let mut rt = test_runtime();
+        let loaded = load_vad_model(&mut rt, Some(&vad_model), true).unwrap();
+        assert!(!loaded);
+    }
+
+    #[test]
+    fn load_vad_model_invalid_onnx_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.onnx"), b"not a real onnx file").unwrap();
+        let vad_model = DiscoveredVadModel {
+            path: dir.path().to_path_buf(),
+            name: "silero-vad".into(),
+        };
+        let mut rt = test_runtime();
+        let err = load_vad_model(&mut rt, Some(&vad_model), false).unwrap_err();
+        assert!(err.to_string().contains("loading VAD model"));
+    }
+
+    #[test]
+    fn print_discovered_models_lists_vad_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let vad_dir = dir.path().join("vad").join("silero-vad");
+        std::fs::create_dir_all(&vad_dir).unwrap();
+        std::fs::write(vad_dir.join("model.onnx"), b"").unwrap();
+        assert!(print_discovered_models(dir.path()).is_ok());
     }
 
     #[test]
