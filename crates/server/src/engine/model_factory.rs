@@ -5,8 +5,8 @@
 // (https://github.com/lucasjinreal/Crane), Copyright (c) 2024 Nicholas Jela,
 // licensed under the MIT License.
 
-//! TTS and ASR model factory for automatic model type detection and
-//! construction.
+//! TTS, ASR, and VAD model factory for automatic model type detection,
+//! construction, and discovery.
 //!
 //! Supports auto-detection from `config.json`'s `model_type` / `architectures`
 //! fields (Qwen3-TTS, Qwen3-ASR) or `params.json`'s `model_type` field
@@ -187,6 +187,55 @@ pub struct DiscoveredModel {
     pub model_type: ModelType,
 }
 
+/// A VAD model discovered by [`discover_vad_model`].
+///
+/// Separate from [`DiscoveredModel`] because VAD models have no
+/// [`ModelType`]-level architecture detection -- the presence of a
+/// `model.onnx` file is sufficient. The `name` field (directory name)
+/// is kept for logging and potential future multi-model support.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DiscoveredVadModel {
+    /// Full path to the model directory (e.g. `<model-path>/vad/silero-vad`).
+    pub path: PathBuf,
+    /// Directory name (the final path component), e.g. `"silero-vad"`.
+    pub name: String,
+}
+
+/// Return the immediate subdirectories of `parent_dir`.
+///
+/// Shared by [`discover_models`], [`discover_asr_models`], and
+/// [`discover_vad_model`]. Non-directory entries (e.g. stray files) are
+/// silently skipped. An entry that fails to stat (e.g. permission denied,
+/// or a race with concurrent deletion) is skipped with a `tracing::warn!`
+/// rather than failing the whole scan.
+///
+/// # Errors
+///
+/// Returns an error if `parent_dir` itself cannot be read.
+fn scan_subdirs(parent_dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(parent_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read model directory '{}': {e}",
+            parent_dir.display()
+        )
+    })?;
+
+    let mut subdirs = Vec::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("cannot read entry in '{}'", parent_dir.display()))?
+            .path();
+        match path.metadata() {
+            Ok(meta) if meta.is_dir() => subdirs.push(path),
+            Ok(_) => {}, // not a directory: silently skip, e.g. stray files
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cannot stat entry; skipping");
+            },
+        }
+    }
+    Ok(subdirs)
+}
+
 /// Scan `parent_dir` for immediate subdirectories containing recognized
 /// TTS models.
 ///
@@ -200,26 +249,8 @@ pub struct DiscoveredModel {
 ///
 /// Returns an error if `parent_dir` cannot be read.
 pub fn discover_models(parent_dir: &Path) -> Result<Vec<DiscoveredModel>> {
-    let entries = std::fs::read_dir(parent_dir).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot read model directory '{}': {e}",
-            parent_dir.display()
-        )
-    })?;
-
     let mut models = Vec::new();
-    for entry in entries {
-        let path = entry
-            .with_context(|| format!("cannot read entry in '{}'", parent_dir.display()))?
-            .path();
-        match path.metadata() {
-            Ok(meta) if meta.is_dir() => {},
-            Ok(_) => continue, // not a directory: silently skip, e.g. stray files
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "cannot stat entry; skipping");
-                continue;
-            },
-        }
+    for path in scan_subdirs(parent_dir)? {
         if let Some(model_type) = probe_model_type(&path)
             && model_type.is_tts()
         {
@@ -250,26 +281,8 @@ pub fn discover_models(parent_dir: &Path) -> Result<Vec<DiscoveredModel>> {
 ///
 /// Returns an error if `parent_dir` cannot be read.
 pub fn discover_asr_models(parent_dir: &Path) -> Result<Vec<DiscoveredModel>> {
-    let entries = std::fs::read_dir(parent_dir).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot read model directory '{}': {e}",
-            parent_dir.display()
-        )
-    })?;
-
     let mut models = Vec::new();
-    for entry in entries {
-        let path = entry
-            .with_context(|| format!("cannot read entry in '{}'", parent_dir.display()))?
-            .path();
-        match path.metadata() {
-            Ok(meta) if meta.is_dir() => {},
-            Ok(_) => continue, // not a directory: silently skip, e.g. stray files
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "cannot stat entry; skipping");
-                continue;
-            },
-        }
+    for path in scan_subdirs(parent_dir)? {
         if let Some(model_type) = probe_model_type(&path)
             && model_type.is_asr()
         {
@@ -286,6 +299,43 @@ pub fn discover_asr_models(parent_dir: &Path) -> Result<Vec<DiscoveredModel>> {
 
     models.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(models)
+}
+
+/// Scan `parent_dir` for the first subdirectory containing a `model.onnx`
+/// file, suitable for Silero VAD.
+///
+/// Unlike [`discover_models`] / [`discover_asr_models`], this does not
+/// probe `config.json` for architecture detection -- a `model.onnx` file
+/// is sufficient. Only one VAD model is supported at a time; when multiple
+/// qualifying subdirectories exist, the first one alphabetically is
+/// returned and the rest are logged and discarded.
+///
+/// Returns `Ok(None)` if `parent_dir` is empty or contains no qualifying
+/// subdirectory.
+///
+/// # Errors
+///
+/// Returns an error if `parent_dir` cannot be read.
+pub fn discover_vad_model(parent_dir: &Path) -> Result<Option<DiscoveredVadModel>> {
+    let mut candidates = Vec::new();
+    for path in scan_subdirs(parent_dir)? {
+        if path.join("model.onnx").is_file() {
+            let name = path
+                .file_name()
+                .map_or_else(|| "vad".to_string(), |n| n.to_string_lossy().into_owned());
+            candidates.push(DiscoveredVadModel { path, name });
+        }
+    }
+
+    candidates.sort_by(|a, b| a.name.cmp(&b.name));
+    if candidates.len() > 1 {
+        tracing::warn!(
+            selected = %candidates[0].name,
+            skipped = ?candidates[1..].iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            "multiple VAD model directories found; using first alphabetically",
+        );
+    }
+    Ok(candidates.into_iter().next())
 }
 
 /// Shared implementation behind [`resolve_models_to_load`] and
@@ -974,6 +1024,84 @@ mod tests {
     fn discover_asr_models_nonexistent_dir_errors() {
         let result = discover_asr_models(Path::new("/nonexistent/parent/dir"));
         assert!(result.is_err());
+    }
+
+    // ── discover_vad_model ──
+
+    #[test]
+    fn discover_vad_model_finds_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("silero-vad");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.onnx"), b"fake-onnx").unwrap();
+
+        let result = discover_vad_model(dir.path()).unwrap();
+        assert_eq!(
+            result,
+            Some(DiscoveredVadModel {
+                path: model_dir,
+                name: "silero-vad".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn discover_vad_model_empty_dir_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(discover_vad_model(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn discover_vad_model_nonexistent_dir_errors() {
+        let result = discover_vad_model(Path::new("/nonexistent/vad/dir"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn discover_vad_model_skips_dirs_without_onnx() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("some-model");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("config.json"), b"{}").unwrap();
+
+        assert_eq!(discover_vad_model(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn discover_vad_model_picks_first_alphabetically() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["beta-vad", "alpha-vad"] {
+            let sub = dir.path().join(name);
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(sub.join("model.onnx"), b"fake").unwrap();
+        }
+
+        let result = discover_vad_model(dir.path()).unwrap().unwrap();
+        assert_eq!(result.name, "alpha-vad");
+    }
+
+    #[test]
+    fn discover_vad_model_skips_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // model.onnx directly in parent_dir, not inside a subdirectory.
+        std::fs::write(dir.path().join("model.onnx"), b"fake").unwrap();
+        assert_eq!(discover_vad_model(dir.path()).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_vad_model_follows_symlinked_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-vad");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("model.onnx"), b"fake").unwrap();
+
+        let link = dir.path().join("linked-vad");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let result = discover_vad_model(dir.path()).unwrap().unwrap();
+        // "linked-vad" comes before "real-vad" alphabetically.
+        assert_eq!(result.name, "linked-vad");
     }
 
     // ── resolve_models_to_load ──
