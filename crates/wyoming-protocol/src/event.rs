@@ -118,6 +118,47 @@ impl AudioStopData {
     }
 }
 
+/// Data for a `voice-started` event.
+///
+/// Emitted by a VAD service when speech is detected in an incoming
+/// audio stream. See the upstream Wyoming schema (`wyoming/vad.py`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VoiceStartedData {
+    /// Optional timestamp in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<u64>,
+}
+
+impl VoiceStartedData {
+    /// Creates a new `VoiceStartedData` with no timestamp.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Data for a `voice-stopped` event.
+///
+/// Emitted by a VAD service when silence follows detected speech in an
+/// incoming audio stream. See the upstream Wyoming schema
+/// (`wyoming/vad.py`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VoiceStoppedData {
+    /// Optional timestamp in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<u64>,
+}
+
+impl VoiceStoppedData {
+    /// Creates a new `VoiceStoppedData` with no timestamp.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Voice specification carried in a `synthesize` event.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -502,6 +543,11 @@ pub enum Event {
     },
     /// Audio stream has stopped.
     AudioStop(AudioStopData),
+    /// Speech has been detected in an incoming audio stream (VAD).
+    VoiceStarted(VoiceStartedData),
+    /// Silence has followed detected speech in an incoming audio
+    /// stream (VAD).
+    VoiceStopped(VoiceStoppedData),
     /// Request to synthesize speech from text.
     Synthesize(SynthesizeData),
     /// Request to transcribe speech to text.
@@ -546,6 +592,10 @@ pub const TYPE_AUDIO_START: &str = "audio-start";
 pub const TYPE_AUDIO_CHUNK: &str = "audio-chunk";
 /// Wire-format type string for `audio-stop` events.
 pub const TYPE_AUDIO_STOP: &str = "audio-stop";
+/// Wire-format type string for `voice-started` events.
+pub const TYPE_VOICE_STARTED: &str = "voice-started";
+/// Wire-format type string for `voice-stopped` events.
+pub const TYPE_VOICE_STOPPED: &str = "voice-stopped";
 /// Wire-format type string for `synthesize` events.
 pub const TYPE_SYNTHESIZE: &str = "synthesize";
 /// Wire-format type string for `transcribe` events.
@@ -577,6 +627,8 @@ impl Event {
             Event::AudioStart(_) => TYPE_AUDIO_START,
             Event::AudioChunk { .. } => TYPE_AUDIO_CHUNK,
             Event::AudioStop(_) => TYPE_AUDIO_STOP,
+            Event::VoiceStarted(_) => TYPE_VOICE_STARTED,
+            Event::VoiceStopped(_) => TYPE_VOICE_STOPPED,
             Event::Synthesize(_) => TYPE_SYNTHESIZE,
             Event::Transcribe(_) => TYPE_TRANSCRIBE,
             Event::Transcript(_) => TYPE_TRANSCRIPT,
@@ -605,6 +657,8 @@ impl Event {
             Event::AudioStart(data) => Some(to_json_vec(data)?),
             Event::AudioChunk { data, .. } => Some(to_json_vec(data)?),
             Event::AudioStop(data) => Some(to_json_vec(data)?),
+            Event::VoiceStarted(data) => Some(to_json_vec(data)?),
+            Event::VoiceStopped(data) => Some(to_json_vec(data)?),
             Event::Synthesize(data) => Some(to_json_vec(data)?),
             Event::Transcribe(data) => Some(to_json_vec(data)?),
             Event::Transcript(data) => Some(to_json_vec(data)?),
@@ -671,6 +725,8 @@ impl Event {
                 audio: payload.unwrap_or_default(),
             },
             TYPE_AUDIO_STOP => Event::AudioStop(from_json_value(data)?),
+            TYPE_VOICE_STARTED => Event::VoiceStarted(from_json_value(data)?),
+            TYPE_VOICE_STOPPED => Event::VoiceStopped(from_json_value(data)?),
             TYPE_SYNTHESIZE => Event::Synthesize(from_json_value(data)?),
             TYPE_TRANSCRIBE => Event::Transcribe(from_json_value(data)?),
             TYPE_TRANSCRIPT => Event::Transcript(from_json_value(data)?),
@@ -773,6 +829,35 @@ mod tests {
 
         let event_no_ts = Event::AudioStop(AudioStopData { timestamp: None });
         assert_eq!(round_trip(&event_no_ts), event_no_ts);
+        assert_eq!(event_no_ts.serialize_data().unwrap(), None);
+    }
+
+    #[test]
+    fn test_voice_started_round_trip() {
+        let event = Event::VoiceStarted(VoiceStartedData {
+            timestamp: Some(123),
+        });
+        assert_eq!(round_trip(&event), event);
+
+        let event_no_ts = Event::VoiceStarted(VoiceStartedData { timestamp: None });
+        assert_eq!(round_trip(&event_no_ts), event_no_ts);
+        // All fields unset serializes to `{}`, which carries no
+        // information and is collapsed to "no data segment" by
+        // `serialize_data`, same as `AudioStopData`/`PingData` with all
+        // fields unset.
+        assert_eq!(event_no_ts.serialize_data().unwrap(), None);
+    }
+
+    #[test]
+    fn test_voice_stopped_round_trip() {
+        let event = Event::VoiceStopped(VoiceStoppedData {
+            timestamp: Some(456),
+        });
+        assert_eq!(round_trip(&event), event);
+
+        let event_no_ts = Event::VoiceStopped(VoiceStoppedData { timestamp: None });
+        assert_eq!(round_trip(&event_no_ts), event_no_ts);
+        assert_eq!(event_no_ts.serialize_data().unwrap(), None);
     }
 
     #[test]
@@ -1074,6 +1159,14 @@ mod tests {
         assert_eq!(
             Event::AudioStop(AudioStopData { timestamp: None }).event_type(),
             "audio-stop"
+        );
+        assert_eq!(
+            Event::VoiceStarted(VoiceStartedData { timestamp: None }).event_type(),
+            "voice-started"
+        );
+        assert_eq!(
+            Event::VoiceStopped(VoiceStoppedData { timestamp: None }).event_type(),
+            "voice-stopped"
         );
         assert_eq!(
             Event::Transcribe(TranscribeData::default()).event_type(),
