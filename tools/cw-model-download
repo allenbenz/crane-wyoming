@@ -3,13 +3,14 @@
 # requires-python = ">=3.9"
 # dependencies = ["huggingface_hub"]
 # ///
-"""Download crane-wyoming TTS and ASR models from Hugging Face.
+"""Download crane-wyoming TTS, ASR, and VAD models from Hugging Face.
 
 Examples:
     ./cw-model-download --list
     ./cw-model-download --model voxtral --path /srv/models
     ./cw-model-download --model qwen3-tts-customvoice-1.7b --path ~/models --token hf_...
     ./cw-model-download --model qwen3-asr-0.6b --path ~/models
+    ./cw-model-download --model silero-vad --path ~/models
 
 Run directly (uv picks up the inline metadata above and manages the
 `huggingface_hub` dependency in an ephemeral venv, no setup needed):
@@ -27,6 +28,7 @@ which speeds up downloads automatically.
 
 import argparse
 import os
+import shutil
 import sys
 
 MODELS = {
@@ -66,9 +68,16 @@ MODELS = {
         "kind": "asr",
         "description": "Qwen3-ASR 1.7B, speech-to-text (Apache-2.0)",
     },
+    "silero-vad": {
+        "repo_id": "onnx-community/silero-vad",
+        "dirname": "silero-vad",
+        "kind": "vad",
+        "files": {"onnx/model.onnx": "model.onnx"},
+        "description": "Silero VAD, voice activity detection (MIT)",
+    },
 }
 
-_VALID_KINDS = ("tts", "asr")
+_VALID_KINDS = ("tts", "asr", "vad")
 _REQUIRED_KEYS = ("repo_id", "dirname", "kind", "description")
 for _key, _info in MODELS.items():
     _missing = [k for k in _REQUIRED_KEYS if k not in _info]
@@ -91,7 +100,7 @@ def list_models():
 
 def download_model(model_key, path, token):
     try:
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import hf_hub_download, snapshot_download
         from huggingface_hub.utils import HfHubHTTPError
     except ImportError:
         print(
@@ -106,7 +115,18 @@ def download_model(model_key, path, token):
 
     print(f"Downloading {info['repo_id']} to {local_dir} ...")
     try:
-        snapshot_download(repo_id=info["repo_id"], local_dir=local_dir, token=token)
+        files = info.get("files")
+        if files:
+            os.makedirs(local_dir, exist_ok=True)
+            for repo_path, local_name in files.items():
+                cached = hf_hub_download(
+                    repo_id=info["repo_id"], filename=repo_path, token=token
+                )
+                shutil.copy2(cached, os.path.join(local_dir, local_name))
+        else:
+            snapshot_download(
+                repo_id=info["repo_id"], local_dir=local_dir, token=token
+            )
     except HfHubHTTPError as e:
         status = e.response.status_code if e.response is not None else None
         print(f"error: download failed: {e}", file=sys.stderr)
@@ -124,12 +144,13 @@ def download_model(model_key, path, token):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download TTS and ASR models for crane-wyoming from Hugging Face.",
+        description="Download TTS, ASR, and VAD models for crane-wyoming from Hugging Face.",
         epilog="examples:\n"
         "  cw-model-download --list\n"
         "  cw-model-download --model voxtral --path /srv/models\n"
         "  cw-model-download --model qwen3-tts-customvoice-1.7b --path ~/models --token hf_...\n"
-        "  cw-model-download --model qwen3-asr-0.6b --path ~/models\n",
+        "  cw-model-download --model qwen3-asr-0.6b --path ~/models\n"
+        "  cw-model-download --model silero-vad --path ~/models\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     group = parser.add_mutually_exclusive_group(required=True)
