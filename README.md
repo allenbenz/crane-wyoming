@@ -43,6 +43,7 @@ It provides the following three executables:
 - Streaming audio synthesis on GPU
 - TCP or Unix domain socket, including systemd socket activation
 - On-disk caching for repeated phrases
+- Optional VAD pre-filtering of ASR input to reduce silence hallucinations
 
 ## TODO
 
@@ -51,7 +52,8 @@ It provides the following three executables:
 * [x] Commandline Client
 * [x] Speech Dispatcher Support
 * [x] Automatic Speech Recognition (ASR)
-* [ ] Voice Activity Detection (VAD)
+* [x] Voice Activity Detection (VAD) for ASR pre-filtering
+* [ ] Standalone VAD service (`voice-started`/`voice-stopped` events)
 * [ ] OpenWakeWord Support
 * [ ] Support for Kokoro Voices
 * [ ] Support for Piper Voices
@@ -85,8 +87,8 @@ This produces three binaries under `target/release/`: `crane-wyoming`,
 
 ## Downloading models
 
-`tools/cw-model-download` fetches TTS and ASR model weights from [Hugging
-Face](https://huggingface.co/). It's a self-contained script so
+`tools/cw-model-download` fetches TTS, ASR, and VAD model weights from
+[Hugging Face](https://huggingface.co/). It's a self-contained script so
 [`uv`](https://docs.astral.sh/uv/) can run it in an ephemeral venv with no
 setup:
 
@@ -97,6 +99,9 @@ setup:
 
 # Download a model
 ./tools/cw-model-download --model voxtral --path /srv/models
+
+# Download the VAD model (see "Voice activity detection" below)
+./tools/cw-model-download --model silero-vad --path /srv/models
 ```
 
 Without `uv`, install the dependency yourself and run with plain `python3`:
@@ -115,22 +120,38 @@ parent directory (`/srv/models`) to `--model-path`.
 ./target/release/crane-wyoming --model-path models --uri unix:///tmp/wyoming.sock
 ```
 
-`--model-path` points at a directory containing `tts/` and/or `asr/`
-subdirectories, each holding one or more model subdirectories for that
-family (a missing `tts/` or `asr/` subdirectory just means zero models of
-that family, e.g. an ASR-only deployment has no `tts/` subdirectory at
-all -- but at least one model of either family must be found). Every
-recognized model found under `tts/`/`asr/` is loaded, with the first one
-of each family (alphabetically) becoming the default voice/ASR model when
-a client doesn't request one by name. Use `--model-tts <name>` /
-`--model-asr <name>` (both repeatable) to load only specific models, in
-which case the first one named is the default. Run `crane-wyoming
---model-path models --list-models` to see which subdirectories are
-recognized and what `--model-tts`/`--model-asr` expect, without starting
-the server. Use `--uri tcp://host:port` (or plain `--host`/`--port`,
-default `0.0.0.0:10200`) to listen on TCP instead of a Unix socket. See
-`crane-wyoming --help` for the rest of the flags (`--cpu`,
-`--max-connections`, `--tts-cache-dir`/`--tts-cache-max-size`).
+`--model-path` points at a directory containing the models. It should contain
+at least a TTS or an ASR model. If there is an ASR model and VAD is also found
+it will be used automatically.
+
+Every recognized model found under `tts/`/`asr/` subdirectories is loaded, with
+the first one of each family (alphabetically) becoming the default voice/ASR
+model when a client doesn't request one by name. Use `--model-tts <name>` /
+`--model-asr <name>` (both repeatable) to load only specific models, in which
+case the first one named is the default.
+
+Run `crane-wyoming --model-path models --list-models` to see which
+subdirectories are recognized and what `--model-tts`/`--model-asr` expect,
+without starting the server.
+
+Use `--uri tcp://host:port` (or plain `--host`/`--port`, default
+`0.0.0.0:10200`) to listen on TCP instead of a Unix socket. See `crane-wyoming
+--help` for the rest of the flags.
+
+### Voice activity detection (VAD)
+
+If a Silero VAD model is present under `<model-path>/vad/` (see
+"Downloading models" above), it's loaded automatically at startup and used
+to strip leading/trailing silence from audio before it's dispatched to ASR
+transcription, reducing hallucinated transcripts on silent regions.
+
+This requires no client-side change: any `transcribe` request is filtered
+transparently. A client can tune how quickly the end of speech is detected by
+setting `vad_sensitivity` (`"default"`, `"relaxed"`, or `"aggressive"`) on the
+`transcribe` event.
+
+When no VAD model is loaded, ASR requests behave exactly as before (no
+filtering, `requires_external_vad: true` in the server's `describe` response).
 
 ### Running as a systemd service
 
