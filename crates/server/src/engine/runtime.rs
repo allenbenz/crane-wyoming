@@ -777,6 +777,13 @@ impl ModelRuntime {
         self.vad = Some(Arc::new(Mutex::new(vad)));
     }
 
+    /// Returns whether a VAD model was loaded under `<model-path>/vad/` at
+    /// startup and is available for [`vad_filter_audio`](Self::vad_filter_audio).
+    #[must_use]
+    pub fn has_vad(&self) -> bool {
+        self.vad.is_some()
+    }
+
     /// Filters `audio` through the loaded Silero VAD model, returning only
     /// the detected speech regions concatenated in their original order.
     ///
@@ -801,10 +808,6 @@ impl ModelRuntime {
     /// Returns an error if no VAD model is loaded, if the blocking task
     /// itself panics or is cancelled, or if VAD
     /// segmentation/configuration fails or panics.
-    // Not yet called: `handle_transcribe` doesn't dispatch through VAD
-    // pre-filtering yet, pending VAD model loading being wired into
-    // `lib.rs` in a follow-up commit.
-    #[allow(dead_code)]
     pub(crate) async fn vad_filter_audio(
         &self,
         audio: Vec<f32>,

@@ -897,10 +897,15 @@ where
 /// `audio-start`/`audio-chunk`*/`audio-stop` sequence via
 /// [`collect_transcribe_audio`] -- these are read directly here rather than
 /// by the caller's main event loop, since they belong to this one
-/// `transcribe` exchange. Dispatches to [`handle_transcribe_streaming`] or
-/// [`handle_transcribe_batch`] depending on [`ModelRuntime::streaming_enabled`],
-/// the same flag [`handle_synthesize`] uses for TTS -- see that method's doc
-/// for why streaming is conditional (in short: CPU hardware can't keep up).
+/// `transcribe` exchange. If a VAD model is loaded and the ASR model's
+/// sample rate is VAD-compatible (see [`vad_decision`]), the
+/// collected audio is pre-filtered through
+/// [`ModelRuntime::vad_filter_audio`] using `data.vad_sensitivity` before
+/// dispatch; otherwise the audio is passed through unfiltered. Dispatches
+/// to [`handle_transcribe_streaming`] or [`handle_transcribe_batch`]
+/// depending on [`ModelRuntime::streaming_enabled`], the same flag
+/// [`handle_synthesize`] uses for TTS -- see that method's doc for why
+/// streaming is conditional (in short: CPU hardware can't keep up).
 async fn handle_transcribe<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -943,10 +948,59 @@ where
     };
     let audio = pcm_i16_to_f32(&pcm_bytes);
 
+    let audio = match vad_decision(runtime, expected_rate) {
+        VadDecision::Skip => audio,
+        VadDecision::IncompatibleRate => {
+            tracing::warn!(
+                sample_rate = expected_rate,
+                "ASR sample rate unsupported by VAD (requires 8000 or 16000 Hz); skipping pre-filtering",
+            );
+            audio
+        },
+        VadDecision::Apply => match runtime.vad_filter_audio(audio, data.vad_sensitivity).await {
+            Ok(filtered) => filtered,
+            Err(e) => {
+                tracing::error!(error = %e, "VAD filtering failed");
+                return send_error(writer, &format!("VAD filtering failed: {e}"), None).await;
+            },
+        },
+    };
+
     if runtime.streaming_enabled() {
         handle_transcribe_streaming(writer, runtime, model_name, audio, data.language).await
     } else {
         handle_transcribe_batch(writer, runtime, model_name, audio, data.language).await
+    }
+}
+
+/// Whether [`handle_transcribe`] should pre-filter collected audio through
+/// VAD before ASR dispatch, as returned by [`vad_decision`].
+enum VadDecision {
+    /// No VAD model is loaded; pass audio through unfiltered.
+    Skip,
+    /// A VAD model is loaded, but the ASR model's sample rate isn't one
+    /// Silero VAD supports; pass audio through unfiltered (with a warning).
+    IncompatibleRate,
+    /// A VAD model is loaded and `sample_rate` is VAD-compatible; filter
+    /// the audio through it.
+    Apply,
+}
+
+/// Decides whether [`handle_transcribe`] should filter audio through VAD,
+/// based on whether a VAD model is loaded and whether `sample_rate` is one
+/// Silero VAD supports (8 kHz or 16 kHz). Every ASR model in Crane today
+/// reports one of these two rates, but
+/// [`crane::audio::Asr::input_sample_rate`] does not constrain callers to
+/// them, so a future model reporting e.g. 24000 or 44100 must skip VAD
+/// pre-filtering rather than feed an unsupported rate into
+/// [`ModelRuntime::vad_filter_audio`].
+fn vad_decision(runtime: &ModelRuntime, sample_rate: u32) -> VadDecision {
+    if !runtime.has_vad() {
+        VadDecision::Skip
+    } else if matches!(sample_rate, 8000 | 16000) {
+        VadDecision::Apply
+    } else {
+        VadDecision::IncompatibleRate
     }
 }
 
@@ -1256,6 +1310,7 @@ mod tests {
     use crane::audio::AudioInfo;
     use crane::audio::tts::{Tts, TtsStream, VoiceInfo};
     use crane::audio::{Asr, TranscribeOptions, Transcript};
+    use crane_core::models::silero_vad::{Vad, VadConfig};
     use std::io::Cursor as SyncCursor;
     use tokio::io::BufReader;
     use wyoming_protocol::event::SynthesizeVoice;
@@ -2435,6 +2490,16 @@ mod tests {
         assert_eq!(vm.model_for_language("de"), Some(("first", "alice")));
     }
 
+    /// Shared `transcribe` body for [`MockAsr`] and [`MockAsrWithRate`],
+    /// which differ only in `input_sample_rate`.
+    fn mock_transcribe(audio: &[f32], opts: &TranscribeOptions) -> Transcript {
+        Transcript {
+            text: format!("heard {} samples", audio.len()),
+            language: opts.language.clone(),
+            is_final: true,
+        }
+    }
+
     struct MockAsr;
 
     impl Asr for MockAsr {
@@ -2443,11 +2508,24 @@ mod tests {
         }
 
         fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOptions) -> Result<Transcript> {
-            Ok(Transcript {
-                text: format!("heard {} samples", audio.len()),
-                language: opts.language.clone(),
-                is_final: true,
-            })
+            Ok(mock_transcribe(audio, opts))
+        }
+    }
+
+    /// An ASR model reporting a sample rate Silero VAD does not support
+    /// (only 8000/16000 are valid), for testing that VAD pre-filtering is
+    /// skipped rather than fed an incompatible rate.
+    struct MockAsrWithRate {
+        rate: u32,
+    }
+
+    impl Asr for MockAsrWithRate {
+        fn input_sample_rate(&self) -> u32 {
+            self.rate
+        }
+
+        fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOptions) -> Result<Transcript> {
+            Ok(mock_transcribe(audio, opts))
         }
     }
 
@@ -3211,6 +3289,88 @@ mod tests {
         assert_eq!(results.len(), 1);
         match &results[0] {
             Event::Error(data) => assert!(data.text.contains("mock transcription failure")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_vad_skipped_for_incompatible_sample_rate() {
+        // The loaded `Vad` has no ONNX model (`Vad::load` was never
+        // called), so if the handler tried to filter through it the
+        // request would fail. A successful transcript here proves the
+        // 24 kHz ASR rate caused VAD pre-filtering to be skipped rather
+        // than attempted.
+        let mut rt = test_runtime();
+        rt.set_streaming_enabled(false);
+        register_test_asr(
+            &mut rt,
+            "m1",
+            "qwen3_asr",
+            Box::new(MockAsrWithRate { rate: 24000 }),
+        );
+        rt.set_vad(Vad::new(VadConfig::default()).unwrap());
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+        let format = AudioFormat {
+            rate: 24000,
+            width: 2,
+            channels: 1,
+        };
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(format)),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(format),
+                    audio: pcm_f32_to_i16(&[0.0; 4]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            results,
+            vec![Event::Transcript(TranscriptData::new("heard 4 samples"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transcribe_vad_filter_failure_sends_error() {
+        // The loaded `Vad` has no ONNX model, so filtering non-trivial
+        // audio at a VAD-compatible rate (16 kHz) fails; the handler must
+        // surface that as an `error` event rather than propagating a hard
+        // connection error.
+        let mut rt = test_runtime();
+        rt.set_streaming_enabled(false);
+        register_test_asr(&mut rt, "m1", "qwen3_asr", Box::new(MockAsr));
+        rt.set_vad(Vad::new(VadConfig::default()).unwrap());
+        let vm = VoiceMap::new(&[], &rt);
+        let am = AsrModelMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &am,
+            vec![
+                Event::Transcribe(TranscribeData::new()),
+                Event::AudioStart(AudioStartData::new(mock_asr_format())),
+                Event::AudioChunk {
+                    data: AudioChunkData::new(mock_asr_format()),
+                    audio: pcm_f32_to_i16(&[0.0; 1024]),
+                },
+                Event::AudioStop(AudioStopData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Event::Error(data) => assert!(data.text.contains("VAD filtering failed")),
             other => panic!("expected Error, got {other:?}"),
         }
     }
