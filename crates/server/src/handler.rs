@@ -1287,6 +1287,7 @@ fn build_info(runtime: &ModelRuntime, voice_map: &VoiceMap, asr_map: &AsrModelMa
                 "attribution": crane_attribution(),
                 "installed": true,
                 "supports_transcript_streaming": streaming_enabled,
+                "requires_external_vad": !runtime.has_vad(),
             })
         })
         .collect();
