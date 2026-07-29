@@ -138,6 +138,12 @@ Use `--uri tcp://host:port` (or plain `--host`/`--port`, default
 `0.0.0.0:10200`) to listen on TCP instead of a Unix socket. See `crane-wyoming
 --help` for the rest of the flags.
 
+### Home Assistant
+
+See [docs/home-assistant.md](docs/home-assistant.md) for adding the Wyoming
+Protocol integration, setting up an Assist voice assistant, and selecting a
+specific voice.
+
 ### Voice activity detection (VAD)
 
 If a Silero VAD model is present under `<model-path>/vad/` (see
