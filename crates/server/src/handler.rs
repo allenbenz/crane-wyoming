@@ -40,6 +40,30 @@ fn base_language_subtag(language: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Maps a Wyoming `synthesize` request's ISO 639-1 language code (e.g.  `"de"`) to the full
+/// language name Crane's Qwen3-TTS engine expects (e.g. `"german"`).
+/// A code with no known mapping including `"auto"`, which every TTS model treats as a special
+/// "detect automatically" value rather than a language name, falls back to its lowercased base
+/// subtag (see
+/// [`base_language_subtag`]).
+fn language_code_to_name(language: &str) -> String {
+    let base = base_language_subtag(language);
+    match base.as_str() {
+        "zh" => "chinese",
+        "en" => "english",
+        "de" => "german",
+        "it" => "italian",
+        "pt" => "portuguese",
+        "es" => "spanish",
+        "ja" => "japanese",
+        "ko" => "korean",
+        "fr" => "french",
+        "ru" => "russian",
+        other => other,
+    }
+    .to_string()
+}
+
 /// Maps voice names to TTS model registration names.
 ///
 /// Built once at startup by scanning all registered TTS models' voices.
@@ -580,10 +604,16 @@ where
     };
     let audio_info = handle.audio_info();
 
-    let language = data
-        .voice
-        .and_then(|v| v.language)
-        .unwrap_or_else(|| "auto".into());
+    // Qwen3-TTS's codec_language_id table is keyed by full English names (see
+    // language_code_to_name); other TTS engines (e.g. Voxtral) take ISO 639-1 codes directly, so
+    // only normalize the subtag for those.
+    let language = data.voice.and_then(|v| v.language).map_or_else(
+        || "auto".into(),
+        |code| match handle.model_type_name() {
+            "qwen3_tts" => language_code_to_name(&code),
+            _ => base_language_subtag(&code),
+        },
+    );
 
     let params = SynthesizeParams {
         text: data.text,
@@ -1306,6 +1336,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use candle_core::{Device, Tensor};
     use crane::audio::AudioInfo;
@@ -1352,6 +1384,38 @@ mod tests {
         ) -> Result<candle_core::Tensor> {
             let n = text.chars().count().max(1);
             Tensor::new(vec![0.5f32; n], &Device::Cpu).map_err(Into::into)
+        }
+    }
+
+    /// A `Tts` that records the `language` it was called with, for
+    /// asserting what the handler actually passed to the model.
+    struct LanguageCapturingTts {
+        voices: Vec<VoiceInfo>,
+        captured_language: Arc<Mutex<Option<String>>>,
+    }
+
+    impl Tts for LanguageCapturingTts {
+        fn audio_info(&self) -> AudioInfo {
+            AudioInfo {
+                sample_rate: 24000,
+                channels: 1,
+                bits_per_sample: 16,
+            }
+        }
+
+        fn voices(&self) -> Vec<VoiceInfo> {
+            self.voices.clone()
+        }
+
+        fn generate_speech(
+            &mut self,
+            _text: &str,
+            language: &str,
+            _voice: Option<&str>,
+            _opts: &SpeechOptions,
+        ) -> Result<candle_core::Tensor> {
+            *self.captured_language.lock().unwrap() = Some(language.to_string());
+            Tensor::new(vec![0.5f32; 1], &Device::Cpu).map_err(Into::into)
         }
     }
 
@@ -1692,6 +1756,64 @@ mod tests {
             Event::AudioStart(data) => assert_eq!(data.rate, 24000),
             other => panic!("expected AudioStart, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_synthesize_language_dispatch_by_model_type() {
+        // Qwen3-TTS's codec_language_id table is keyed by full English
+        // names, but Voxtral takes ISO 639-1 codes directly; requesting
+        // "de-DE" must reach each model in its own expected format.
+        let qwen3_language = Arc::new(Mutex::new(None));
+        let voxtral_language = Arc::new(Mutex::new(None));
+
+        let mut rt = test_runtime();
+        rt.set_streaming_enabled(false);
+        register_test_tts(
+            &mut rt,
+            "q",
+            "qwen3_tts",
+            Box::new(LanguageCapturingTts {
+                voices: voices(&["q_voice"]),
+                captured_language: Arc::clone(&qwen3_language),
+            }),
+        );
+        register_test_tts(
+            &mut rt,
+            "v",
+            "voxtral_tts",
+            Box::new(LanguageCapturingTts {
+                voices: voices(&["v_voice"]),
+                captured_language: Arc::clone(&voxtral_language),
+            }),
+        );
+        let vm = VoiceMap::new(&["q".to_string(), "v".to_string()], &rt);
+
+        let mut voice = SynthesizeVoice::with_name("q_voice");
+        voice.language = Some("de-DE".to_string());
+        run_events(
+            &rt,
+            &vm,
+            &AsrModelMap::new(&[], &rt),
+            vec![Event::Synthesize(
+                SynthesizeData::new("hi").with_voice(voice),
+            )],
+        )
+        .await;
+
+        let mut voice = SynthesizeVoice::with_name("v_voice");
+        voice.language = Some("de-DE".to_string());
+        run_events(
+            &rt,
+            &vm,
+            &AsrModelMap::new(&[], &rt),
+            vec![Event::Synthesize(
+                SynthesizeData::new("hi").with_voice(voice),
+            )],
+        )
+        .await;
+
+        assert_eq!(qwen3_language.lock().unwrap().as_deref(), Some("german"));
+        assert_eq!(voxtral_language.lock().unwrap().as_deref(), Some("de"));
     }
 
     #[tokio::test]
@@ -2426,6 +2548,28 @@ mod tests {
         let vm = VoiceMap::new(&[], &rt);
         assert_eq!(vm.default_model(), None);
         assert_eq!(vm.model_for_voice("anything"), None);
+    }
+
+    #[test]
+    fn test_language_code_to_name() {
+        assert_eq!(language_code_to_name("de"), "german");
+        assert_eq!(language_code_to_name("en"), "english");
+        assert_eq!(language_code_to_name("zh"), "chinese");
+        // Matching is on the base subtag only, case-insensitively, and
+        // accepts both `-` and `_` as the subtag separator.
+        assert_eq!(language_code_to_name("DE-DE"), "german");
+        assert_eq!(language_code_to_name("de_DE"), "german");
+        // Bare uppercase code with no separator still matches.
+        assert_eq!(language_code_to_name("IT"), "italian");
+    }
+
+    #[test]
+    fn test_language_code_to_name_passes_through_unknown() {
+        // "auto" is a special value every TTS model treats as "detect
+        // automatically", not a language name; it must not be mapped.
+        assert_eq!(language_code_to_name("auto"), "auto");
+        assert_eq!(language_code_to_name("xx"), "xx");
+        assert_eq!(language_code_to_name(""), "");
     }
 
     #[test]
