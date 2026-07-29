@@ -10,6 +10,7 @@ steps:
       CARGO_TERM_COLOR: always
       SCCACHE_CACHE_SIZE: "1G"
       RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
     commands:
       - export CARGO_HOME="`pwd`/build-cache/cargo"
       - export SCCACHE_DIR="`pwd`/build-cache/sccache"
@@ -26,6 +27,7 @@ steps:
       CARGO_TERM_COLOR: always
       SCCACHE_CACHE_SIZE: "1G"
       RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
     commands:
       - export CARGO_HOME="`pwd`/build-cache/cargo"
       - export SCCACHE_DIR="`pwd`/build-cache/sccache"
