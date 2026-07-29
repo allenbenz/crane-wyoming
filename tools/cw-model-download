@@ -118,11 +118,15 @@ def download_model(model_key, path, token):
         files = info.get("files")
         if files:
             os.makedirs(local_dir, exist_ok=True)
-            for repo_path, local_name in files.items():
-                cached = hf_hub_download(
-                    repo_id=info["repo_id"], filename=repo_path, token=token
-                )
-                shutil.copy2(cached, os.path.join(local_dir, local_name))
+            try:
+                for repo_path, local_name in files.items():
+                    cached = hf_hub_download(
+                        repo_id=info["repo_id"], filename=repo_path, token=token
+                    )
+                    shutil.copy2(cached, os.path.join(local_dir, local_name))
+            except Exception:
+                shutil.rmtree(local_dir, ignore_errors=True)
+                raise
         else:
             snapshot_download(
                 repo_id=info["repo_id"], local_dir=local_dir, token=token
