@@ -40,30 +40,6 @@ fn base_language_subtag(language: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Maps a Wyoming `synthesize` request's ISO 639-1 language code (e.g.  `"de"`) to the full
-/// language name Crane's Qwen3-TTS engine expects (e.g. `"german"`).
-/// A code with no known mapping including `"auto"`, which every TTS model treats as a special
-/// "detect automatically" value rather than a language name, falls back to its lowercased base
-/// subtag (see
-/// [`base_language_subtag`]).
-fn language_code_to_name(language: &str) -> String {
-    let base = base_language_subtag(language);
-    match base.as_str() {
-        "zh" => "chinese",
-        "en" => "english",
-        "de" => "german",
-        "it" => "italian",
-        "pt" => "portuguese",
-        "es" => "spanish",
-        "ja" => "japanese",
-        "ko" => "korean",
-        "fr" => "french",
-        "ru" => "russian",
-        other => other,
-    }
-    .to_string()
-}
-
 /// Maps voice names to TTS model registration names.
 ///
 /// Built once at startup by scanning all registered TTS models' voices.
@@ -604,16 +580,12 @@ where
     };
     let audio_info = handle.audio_info();
 
-    // Qwen3-TTS's codec_language_id table is keyed by full English names (see
-    // language_code_to_name); other TTS engines (e.g. Voxtral) take ISO 639-1 codes directly, so
-    // only normalize the subtag for those.
-    let language = data.voice.and_then(|v| v.language).map_or_else(
-        || "auto".into(),
-        |code| match handle.model_type_name() {
-            "qwen3_tts" => language_code_to_name(&code),
-            _ => base_language_subtag(&code),
-        },
-    );
+    // Every Tts impl in the crane crate accepts ISO 639-1 codes (or "auto") and
+    // converts to whatever format the underlying model needs internally.
+    let language = data
+        .voice
+        .and_then(|v| v.language)
+        .map_or_else(|| "auto".into(), |code| base_language_subtag(&code));
 
     let params = SynthesizeParams {
         text: data.text,
@@ -2548,28 +2520,6 @@ mod tests {
         let vm = VoiceMap::new(&[], &rt);
         assert_eq!(vm.default_model(), None);
         assert_eq!(vm.model_for_voice("anything"), None);
-    }
-
-    #[test]
-    fn test_language_code_to_name() {
-        assert_eq!(language_code_to_name("de"), "german");
-        assert_eq!(language_code_to_name("en"), "english");
-        assert_eq!(language_code_to_name("zh"), "chinese");
-        // Matching is on the base subtag only, case-insensitively, and
-        // accepts both `-` and `_` as the subtag separator.
-        assert_eq!(language_code_to_name("DE-DE"), "german");
-        assert_eq!(language_code_to_name("de_DE"), "german");
-        // Bare uppercase code with no separator still matches.
-        assert_eq!(language_code_to_name("IT"), "italian");
-    }
-
-    #[test]
-    fn test_language_code_to_name_passes_through_unknown() {
-        // "auto" is a special value every TTS model treats as "detect
-        // automatically", not a language name; it must not be mapped.
-        assert_eq!(language_code_to_name("auto"), "auto");
-        assert_eq!(language_code_to_name("xx"), "xx");
-        assert_eq!(language_code_to_name(""), "");
     }
 
     #[test]

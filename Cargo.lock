@@ -860,7 +860,7 @@ dependencies = [
 [[package]]
 name = "crane"
 version = "0.1.0"
-source = "git+https://github.com/lucasjinreal/Crane?rev=943b55bf1065efdee01dae70ec621319592bd6e3#943b55bf1065efdee01dae70ec621319592bd6e3"
+source = "git+https://github.com/lucasjinreal/Crane?rev=82409a2f15a5eedac97c7954c6d8d045b9e93350#82409a2f15a5eedac97c7954c6d8d045b9e93350"
 dependencies = [
  "anyhow",
  "audioadapter-buffers",
@@ -881,7 +881,7 @@ dependencies = [
 [[package]]
 name = "crane-core"
 version = "0.1.0"
-source = "git+https://github.com/lucasjinreal/Crane?rev=943b55bf1065efdee01dae70ec621319592bd6e3#943b55bf1065efdee01dae70ec621319592bd6e3"
+source = "git+https://github.com/lucasjinreal/Crane?rev=82409a2f15a5eedac97c7954c6d8d045b9e93350#82409a2f15a5eedac97c7954c6d8d045b9e93350"
 dependencies = [
  "ahash",
  "anyhow",
