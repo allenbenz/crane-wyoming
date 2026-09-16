@@ -24,12 +24,14 @@
 //!
 //! This crate intentionally models only the subset of Wyoming events
 //! needed for TTS, ASR, and VAD service integration: `synthesize`,
-//! `audio-start`, `audio-chunk`, `audio-stop`, `voice-started`,
-//! `voice-stopped`, `transcribe`, `transcript`, `transcript-start`,
-//! `transcript-chunk`, `transcript-stop`, `describe`/`info`, `ping`/
-//! `pong`, and `error`. Wake-word and intent events are not included.
-//! Unrecognized event types are preserved as [`Event::Unknown`] for
-//! forward compatibility.
+//! `synthesize-start`/`synthesize-chunk`/`synthesize-stop`/
+//! `synthesize-stopped` (streamed text synthesis), `audio-start`,
+//! `audio-chunk`, `audio-stop`,
+//! `voice-started`, `voice-stopped`, `transcribe`, `transcript`,
+//! `transcript-start`, `transcript-chunk`, `transcript-stop`, `describe`/
+//! `info`, `ping`/`pong`, and `error`. Wake-word and intent events are not
+//! included. Unrecognized event types are preserved as [`Event::Unknown`]
+//! for forward compatibility.
 //!
 //! # Module layout
 //!

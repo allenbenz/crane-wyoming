@@ -11,12 +11,15 @@ This crate only depends on `tokio` (`io-util`), `serde`, `serde_json`, and
 ## Scope
 
 Currently implements the TTS- and ASR-relevant subset of the Wyoming event
-catalog plus the shared control events: `synthesize`, `audio-start`/
-`audio-chunk`/`audio-stop`, `transcribe`, `transcript`, `transcript-start`/
-`transcript-chunk`/`transcript-stop`, `describe`/`info`, `ping`/`pong`,
-and `error`. Wake word and other Wyoming domains aren't modeled yet;
-unrecognized event types deserialize to `Event::Unknown` instead of failing,
-so unmodeled events pass through rather than breaking the connection.
+catalog plus the shared control events: `synthesize`, `synthesize-start`/
+`synthesize-chunk`/`synthesize-stop`/`synthesize-stopped` (streamed text
+synthesis),
+`audio-start`/`audio-chunk`/`audio-stop`, `transcribe`, `transcript`,
+`transcript-start`/`transcript-chunk`/`transcript-stop`, `describe`/`info`,
+`ping`/`pong`, and `error`. Wake word and other Wyoming domains aren't
+modeled yet; unrecognized event types deserialize to `Event::Unknown`
+instead of failing, so unmodeled events pass through rather than breaking
+the connection.
 
 ## Modules
 

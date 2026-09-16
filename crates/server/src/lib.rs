@@ -604,7 +604,14 @@ fn resolve_device_and_dtype(
     } else {
         #[cfg(feature = "cuda")]
         {
-            crane_core::models::Device::cuda_if_available(0)?
+            // new_cuda_with_stream, NOT cuda_if_available/new_cuda: candle's
+            // default CudaDevice::new hands out per-thread default streams
+            // (cudaStreamPerThread) while cudarc's cross-stream event guards
+            // stay disabled (num_streams == 0), so tensors read from another
+            // thread (the tokio handlers) race with in-flight kernels and
+            // come back as garbled audio. An explicit stream activates the
+            // guards and serializes all device work on one stream.
+            crane_core::models::Device::new_cuda_with_stream(0)?
         }
         #[cfg(not(feature = "cuda"))]
         {

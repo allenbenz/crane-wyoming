@@ -22,8 +22,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["io-util", "sync", "net", "rt-multi-thread", "macros", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-crane = { git = "https://github.com/allenbenz/Crane", rev = "14e24ef253c24fa18c8ab7967e69ab2720ec941d", features = ["onnx"] }
-crane-core = { git = "https://github.com/allenbenz/Crane", rev = "14e24ef253c24fa18c8ab7967e69ab2720ec941d", features = ["onnx"] }
+crane = { git = "https://github.com/allenbenz/Crane", rev = "5a761ba41727cc8a374eb82d7e334c3e6fd5231e", features = ["onnx"] }
+crane-core = { git = "https://github.com/allenbenz/Crane", rev = "5a761ba41727cc8a374eb82d7e334c3e6fd5231e", features = ["onnx"] }
 # Keep in sync with Crane
 candle-core = "0.11"
 

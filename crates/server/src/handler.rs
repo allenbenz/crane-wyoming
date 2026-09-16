@@ -25,8 +25,8 @@ use tokio::sync::oneshot;
 
 use wyoming_protocol::event::{
     AudioChunkData, AudioFormat, AudioStartData, AudioStopData, ErrorData, Event, InfoData,
-    PingData, PongData, SynthesizeData, TranscribeData, TranscriptChunkData, TranscriptData,
-    TranscriptStartData,
+    PingData, PongData, SynthesizeData, SynthesizeStartData, SynthesizeVoice, TranscribeData,
+    TranscriptChunkData, TranscriptData, TranscriptStartData,
 };
 use wyoming_protocol::wire::{read_event, write_event};
 
@@ -411,6 +411,9 @@ where
 
         match event {
             Event::Synthesize(data) => handle_synthesize(writer, runtime, voice_map, data).await?,
+            Event::SynthesizeStart(data) => {
+                handle_synthesize_streamed_text(reader, writer, runtime, voice_map, data).await?;
+            },
             Event::Transcribe(data) => {
                 handle_transcribe(reader, writer, runtime, asr_map, data).await?;
             },
@@ -601,6 +604,89 @@ where
     }
 }
 
+/// Handle a `synthesize-start` event: read the `synthesize-chunk`*/
+/// `synthesize-stop` sequence that follows, then dispatch the concatenated
+/// text through the same path as a one-shot `synthesize` event, and
+/// terminate the exchange with `synthesize-stopped`.
+///
+/// The chunks are read here rather than by the caller's main event loop,
+/// since they belong to this one synthesize exchange -- the same convention
+/// [`handle_transcribe`] uses for its `audio-*` sequence.
+///
+/// The start event's `language` and `voice` play the same role as the voice
+/// specification of a one-shot `synthesize` (see [`resolve_voice`]): a voice
+/// name wins, then a language, then the default model. When both the start
+/// event's `language` and its `voice.language` are set, the voice's own
+/// language wins, since it is the more specific choice.
+///
+/// `synthesize-stopped` (the Wyoming protocol's "end of streaming
+/// response" event, `wyoming.tts.SynthesizeStopped`) is sent after the
+/// audio stream -- including after an `error` response, where it merely
+/// confirms the exchange is over. Home Assistant's streaming TTS reader
+/// ends on `synthesize-stopped`, not `audio-stop`; without it the client
+/// hangs until the idle timeout closes the connection and never plays the
+/// audio. Reference Wyoming TTS servers (e.g. wyoming-piper) send it too.
+async fn handle_synthesize_streamed_text<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    runtime: &ModelRuntime,
+    voice_map: &VoiceMap,
+    start: SynthesizeStartData,
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut text = String::new();
+    loop {
+        let Some(event) = read_event_or_idle(reader).await? else {
+            return Ok(());
+        };
+        match event {
+            Event::SynthesizeChunk(chunk) => text.push_str(&chunk.text),
+            Event::SynthesizeStop => break,
+            Event::Synthesize(_) => (),
+            other => {
+                tracing::warn!(
+                    event_type = %other.event_type(),
+                    "Expected synthesize-chunk or synthesize-stop during streamed synthesize",
+                );
+                send_error(
+                    writer,
+                    "Expected synthesize-chunk or synthesize-stop during streamed synthesize",
+                    None,
+                )
+                .await?;
+                return Ok(());
+            },
+        }
+    }
+
+    // Fold the start event's fields into the one-shot synthesize shape:
+    // the resolver looks for name and language on the voice, so a bare
+    // top-level `language` is carried by a synthesized voice spec.
+    let voice = match start.voice {
+        Some(mut voice) => {
+            if voice.language.is_none() {
+                voice.language = start.language;
+            }
+            Some(voice)
+        },
+        None => start.language.map(|language| {
+            let mut voice = SynthesizeVoice::new();
+            voice.language = Some(language);
+            voice
+        }),
+    };
+
+    let data = match voice {
+        Some(voice) => SynthesizeData::new(text).with_voice(voice),
+        None => SynthesizeData::new(text),
+    };
+    handle_synthesize(writer, runtime, voice_map, data).await?;
+    write_event_timeout(writer, &Event::SynthesizeStopped).await
+}
+
 /// Generate TTS audio incrementally and send it back as it's produced.
 ///
 /// Audio is sent as it's generated: `audio-start` is delayed until the
@@ -742,8 +828,9 @@ where
     Ok(())
 }
 
-/// Wait for the next event during audio collection (part of handling a
-/// `transcribe` request), giving up after [`IDLE_TIMEOUT`].
+/// Wait for the next event during a multi-event exchange (audio collection
+/// for `transcribe`, text collection for streamed `synthesize`), giving up
+/// after [`IDLE_TIMEOUT`].
 ///
 /// Returns `Ok(None)` if the client disconnected cleanly or went idle --
 /// both end the connection the same way the main loop in
@@ -756,13 +843,13 @@ where
     match tokio::time::timeout(IDLE_TIMEOUT, read_event(reader)).await {
         Ok(Ok(Some(event))) => Ok(Some(event)),
         Ok(Ok(None)) => {
-            tracing::debug!("Client disconnected during audio collection");
+            tracing::debug!("Client disconnected during event collection");
             Ok(None)
         },
         Ok(Err(e)) => Err(e.into()),
         Err(_) => {
             tracing::info!(
-                "Client idle for {IDLE_TIMEOUT:?} during audio collection, disconnecting",
+                "Client idle for {IDLE_TIMEOUT:?} during event collection, disconnecting",
             );
             Ok(None)
         },
@@ -1318,7 +1405,7 @@ mod tests {
     use crane_core::models::silero_vad::{Vad, VadConfig};
     use std::io::Cursor as SyncCursor;
     use tokio::io::BufReader;
-    use wyoming_protocol::event::SynthesizeVoice;
+    use wyoming_protocol::event::SynthesizeChunkData;
 
     struct MockTts {
         audio_info: AudioInfo,
@@ -2039,6 +2126,161 @@ mod tests {
         assert!(matches!(results[2], Event::AudioStop(_)));
         match &results[3] {
             Event::Error(data) => assert!(data.text.contains("mid-stream failure")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_synthesize_streamed_text_joins_chunks() {
+        let mut rt = test_runtime();
+        register_test_tts(
+            &mut rt,
+            "m1",
+            "qwen3_tts",
+            Box::new(MockTts::new(24000, voices(&["alice"]))),
+        );
+        let vm = VoiceMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &AsrModelMap::new(&[], &rt),
+            vec![
+                Event::SynthesizeStart(
+                    SynthesizeStartData::new().with_voice(SynthesizeVoice::with_name("alice")),
+                ),
+                Event::SynthesizeChunk(SynthesizeChunkData::new("hel")),
+                Event::SynthesizeChunk(SynthesizeChunkData::new("lo")),
+                Event::SynthesizeStop,
+            ],
+        )
+        .await;
+
+        // Same output as a one-shot `synthesize` of the joined text, plus
+        // the terminating `synthesize-stopped` of the streamed exchange:
+        // MockTts emits one sample per character, so 5 samples prove the
+        // chunks were concatenated into "hello".
+        assert_eq!(results.len(), 4);
+        assert!(matches!(results[0], Event::AudioStart(_)));
+        match &results[1] {
+            Event::AudioChunk { audio, .. } => {
+                assert_eq!(*audio, pcm_f32_to_i16(&[0.5f32; 5]));
+            },
+            other => panic!("expected AudioChunk, got {other:?}"),
+        }
+        assert!(matches!(results[2], Event::AudioStop(_)));
+        // Home Assistant's streaming TTS reader waits for this event.
+        assert_eq!(results[3], Event::SynthesizeStopped);
+    }
+
+    #[tokio::test]
+    async fn test_synthesize_streamed_text_language_selects_model() {
+        let mut rt = test_runtime();
+        register_test_tts(
+            &mut rt,
+            "a",
+            "qwen3_tts",
+            Box::new(MockTts::new(
+                24000,
+                vec![VoiceInfo {
+                    name: "casual".into(),
+                    languages: vec!["en".into()],
+                }],
+            )),
+        );
+        register_test_tts(
+            &mut rt,
+            "b",
+            "voxtral_tts",
+            Box::new(MockTts::new(
+                16000,
+                vec![VoiceInfo {
+                    name: "de_female".into(),
+                    languages: vec!["de".into()],
+                }],
+            )),
+        );
+        // "a" is the default model (registered first), but a streamed
+        // request for German with no explicit voice must resolve to "b"'s
+        // German voice, like a one-shot synthesize does.
+        let vm = VoiceMap::new(&["a".to_string(), "b".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &AsrModelMap::new(&[], &rt),
+            vec![
+                Event::SynthesizeStart(SynthesizeStartData::new().with_language("de-DE")),
+                Event::SynthesizeChunk(SynthesizeChunkData::new("hallo")),
+                Event::SynthesizeStop,
+            ],
+        )
+        .await;
+
+        match &results[0] {
+            Event::AudioStart(data) => assert_eq!(data.rate, 16000),
+            other => panic!("expected AudioStart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_synthesize_no_synthesize_stopped_for_one_shot() {
+        // `synthesize-stopped` terminates streamed-text exchanges only; a
+        // one-shot `synthesize` ends at `audio-stop` (matching reference
+        // Wyoming servers and HA's non-streaming reader).
+        let mut rt = test_runtime();
+        register_test_tts(
+            &mut rt,
+            "m1",
+            "qwen3_tts",
+            Box::new(MockTts::new(24000, voices(&["alice"]))),
+        );
+        let vm = VoiceMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &AsrModelMap::new(&[], &rt),
+            vec![Event::Synthesize(
+                SynthesizeData::new("hello").with_voice(SynthesizeVoice::with_name("alice")),
+            )],
+        )
+        .await;
+
+        assert_eq!(results.len(), 3);
+        assert!(matches!(results[0], Event::AudioStart(_)));
+        assert!(matches!(results[1], Event::AudioChunk { .. }));
+        assert!(matches!(results[2], Event::AudioStop(_)));
+    }
+
+    #[tokio::test]
+    async fn test_synthesize_streamed_text_unexpected_event() {
+        let mut rt = test_runtime();
+        register_test_tts(
+            &mut rt,
+            "m1",
+            "qwen3_tts",
+            Box::new(MockTts::new(24000, voices(&["alice"]))),
+        );
+        let vm = VoiceMap::new(&["m1".to_string()], &rt);
+
+        let results = run_events(
+            &rt,
+            &vm,
+            &AsrModelMap::new(&[], &rt),
+            vec![
+                Event::SynthesizeStart(SynthesizeStartData::new()),
+                Event::SynthesizeChunk(SynthesizeChunkData::new("hi")),
+                Event::Ping(PingData::new()),
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Event::Error(data) => {
+                assert!(data.text.contains("synthesize-chunk"));
+            },
             other => panic!("expected Error, got {other:?}"),
         }
     }

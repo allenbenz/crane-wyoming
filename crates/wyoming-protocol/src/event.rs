@@ -220,6 +220,57 @@ impl SynthesizeData {
     }
 }
 
+/// Data for a `synthesize-start` event: the language and voice that apply
+/// to the whole `synthesize-chunk`*/`synthesize-stop` sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SynthesizeStartData {
+    /// Language of the text to synthesize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Optional voice specification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<SynthesizeVoice>,
+}
+
+impl SynthesizeStartData {
+    /// Creates a new `SynthesizeStartData` with no language or voice set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the language of the text to synthesize.
+    #[must_use]
+    pub fn with_language(mut self, language: impl Into<String>) -> Self {
+        self.language = Some(language.into());
+        self
+    }
+
+    /// Sets the voice specification for this synthesize request.
+    #[must_use]
+    pub fn with_voice(mut self, voice: SynthesizeVoice) -> Self {
+        self.voice = Some(voice);
+        self
+    }
+}
+
+/// Data for a `synthesize-chunk` event (streamed text synthesis).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SynthesizeChunkData {
+    /// Chunk of text to synthesize.
+    pub text: String,
+}
+
+impl SynthesizeChunkData {
+    /// Creates a new `SynthesizeChunkData` with the given text chunk.
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+}
+
 /// How quickly the end of a voice command is detected.
 ///
 /// Sent by the client in the `transcribe` event's `vad_sensitivity`
@@ -550,6 +601,17 @@ pub enum Event {
     VoiceStopped(VoiceStoppedData),
     /// Request to synthesize speech from text.
     Synthesize(SynthesizeData),
+    /// Start of streamed text to synthesize; the
+    /// synthesized audio is returned as `audio-*` events.
+    SynthesizeStart(SynthesizeStartData),
+    /// A chunk of streamed text to synthesize
+    SynthesizeChunk(SynthesizeChunkData),
+    /// End of streamed text to synthesize
+    SynthesizeStop,
+    /// End of the streamed synthesis response. Sent by the server after
+    /// the final `audio-stop` of a `synthesize-start`/`synthesize-stop`
+    /// exchange; no data, no payload.
+    SynthesizeStopped,
     /// Request to transcribe speech to text.
     Transcribe(TranscribeData),
     /// Result of transcribing speech to text.
@@ -598,6 +660,14 @@ pub const TYPE_VOICE_STARTED: &str = "voice-started";
 pub const TYPE_VOICE_STOPPED: &str = "voice-stopped";
 /// Wire-format type string for `synthesize` events.
 pub const TYPE_SYNTHESIZE: &str = "synthesize";
+/// Wire-format type string for `synthesize-start` events.
+pub const TYPE_SYNTHESIZE_START: &str = "synthesize-start";
+/// Wire-format type string for `synthesize-chunk` events.
+pub const TYPE_SYNTHESIZE_CHUNK: &str = "synthesize-chunk";
+/// Wire-format type string for `synthesize-stop` events.
+pub const TYPE_SYNTHESIZE_STOP: &str = "synthesize-stop";
+/// Wire-format type string for `synthesize-stopped` events.
+pub const TYPE_SYNTHESIZE_STOPPED: &str = "synthesize-stopped";
 /// Wire-format type string for `transcribe` events.
 pub const TYPE_TRANSCRIBE: &str = "transcribe";
 /// Wire-format type string for `transcript` events.
@@ -630,6 +700,10 @@ impl Event {
             Event::VoiceStarted(_) => TYPE_VOICE_STARTED,
             Event::VoiceStopped(_) => TYPE_VOICE_STOPPED,
             Event::Synthesize(_) => TYPE_SYNTHESIZE,
+            Event::SynthesizeStart(_) => TYPE_SYNTHESIZE_START,
+            Event::SynthesizeChunk(_) => TYPE_SYNTHESIZE_CHUNK,
+            Event::SynthesizeStop => TYPE_SYNTHESIZE_STOP,
+            Event::SynthesizeStopped => TYPE_SYNTHESIZE_STOPPED,
             Event::Transcribe(_) => TYPE_TRANSCRIBE,
             Event::Transcript(_) => TYPE_TRANSCRIPT,
             Event::TranscriptStart(_) => TYPE_TRANSCRIPT_START,
@@ -660,11 +734,16 @@ impl Event {
             Event::VoiceStarted(data) => Some(to_json_vec(data)?),
             Event::VoiceStopped(data) => Some(to_json_vec(data)?),
             Event::Synthesize(data) => Some(to_json_vec(data)?),
+            Event::SynthesizeStart(data) => Some(to_json_vec(data)?),
+            Event::SynthesizeChunk(data) => Some(to_json_vec(data)?),
             Event::Transcribe(data) => Some(to_json_vec(data)?),
             Event::Transcript(data) => Some(to_json_vec(data)?),
             Event::TranscriptStart(data) => Some(to_json_vec(data)?),
             Event::TranscriptChunk(data) => Some(to_json_vec(data)?),
-            Event::TranscriptStop | Event::Describe => None,
+            Event::SynthesizeStop
+            | Event::SynthesizeStopped
+            | Event::TranscriptStop
+            | Event::Describe => None,
             Event::Info(data) => Some(to_json_vec(data)?),
             Event::Ping(data) => Some(to_json_vec(data)?),
             Event::Pong(data) => Some(to_json_vec(data)?),
@@ -728,6 +807,10 @@ impl Event {
             TYPE_VOICE_STARTED => Event::VoiceStarted(from_json_value(data)?),
             TYPE_VOICE_STOPPED => Event::VoiceStopped(from_json_value(data)?),
             TYPE_SYNTHESIZE => Event::Synthesize(from_json_value(data)?),
+            TYPE_SYNTHESIZE_START => Event::SynthesizeStart(from_json_value(data)?),
+            TYPE_SYNTHESIZE_CHUNK => Event::SynthesizeChunk(from_json_value(data)?),
+            TYPE_SYNTHESIZE_STOP => Event::SynthesizeStop,
+            TYPE_SYNTHESIZE_STOPPED => Event::SynthesizeStopped,
             TYPE_TRANSCRIBE => Event::Transcribe(from_json_value(data)?),
             TYPE_TRANSCRIPT => Event::Transcript(from_json_value(data)?),
             TYPE_TRANSCRIPT_START => Event::TranscriptStart(from_json_value(data)?),
@@ -833,6 +916,14 @@ mod tests {
     }
 
     #[test]
+    fn test_synthesize_stopped_round_trip() {
+        let event = Event::SynthesizeStopped;
+        assert_eq!(event.event_type(), "synthesize-stopped");
+        assert_eq!(event.serialize_data().unwrap(), None);
+        assert_eq!(round_trip(&event), event);
+    }
+
+    #[test]
     fn test_voice_started_round_trip() {
         let event = Event::VoiceStarted(VoiceStartedData {
             timestamp: Some(123),
@@ -879,6 +970,82 @@ mod tests {
             text: "hi".to_string(),
             voice: None,
         });
+        assert_eq!(round_trip(&event), event);
+    }
+
+    #[test]
+    fn test_synthesize_start_round_trip() {
+        let event = Event::SynthesizeStart(SynthesizeStartData {
+            language: Some("en".to_string()),
+            voice: Some(SynthesizeVoice {
+                name: Some("alice".to_string()),
+                language: Some("en".to_string()),
+                speaker: Some("default".to_string()),
+            }),
+        });
+        assert_eq!(round_trip(&event), event);
+    }
+
+    #[test]
+    fn test_synthesize_start_minimal() {
+        let event = Event::SynthesizeStart(SynthesizeStartData::default());
+        assert_eq!(round_trip(&event), event);
+        assert_eq!(event.serialize_data().unwrap(), None);
+    }
+
+    #[test]
+    fn test_synthesize_start_language_only() {
+        let event = Event::SynthesizeStart(SynthesizeStartData {
+            language: Some("de".to_string()),
+            voice: None,
+        });
+        assert_eq!(round_trip(&event), event);
+        let bytes = event.serialize_data().unwrap().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("language"));
+        assert!(!text.contains("voice"));
+    }
+
+    #[test]
+    fn test_synthesize_start_voice_only() {
+        let event = Event::SynthesizeStart(
+            SynthesizeStartData::new().with_voice(SynthesizeVoice::with_name("alice")),
+        );
+        assert_eq!(round_trip(&event), event);
+        let bytes = event.serialize_data().unwrap().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("voice"));
+        assert!(text.contains("name"));
+        assert!(!text.contains("language"));
+    }
+
+    #[test]
+    fn test_synthesize_chunk_round_trip() {
+        let event = Event::SynthesizeChunk(SynthesizeChunkData::new("hel"));
+        assert_eq!(round_trip(&event), event);
+        let bytes = event.serialize_data().unwrap().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("text"));
+    }
+
+    #[test]
+    fn test_synthesize_chunk_empty_text() {
+        let event = Event::SynthesizeChunk(SynthesizeChunkData::new(""));
+        assert_eq!(round_trip(&event), event);
+    }
+
+    #[test]
+    fn test_synthesize_chunk_missing_text_is_error() {
+        let err = Event::from_wire(TYPE_SYNTHESIZE_CHUNK, json!({}), None)
+            .expect_err("missing required `text` field must fail to deserialize");
+        assert!(matches!(err, ProtocolError::InvalidEventData(_)));
+    }
+
+    #[test]
+    fn test_synthesize_stop_round_trip() {
+        let event = Event::SynthesizeStop;
+        assert_eq!(event.serialize_data().unwrap(), None);
+        assert_eq!(event.payload(), None);
         assert_eq!(round_trip(&event), event);
     }
 
@@ -1185,5 +1352,14 @@ mod tests {
             "transcript-chunk"
         );
         assert_eq!(Event::TranscriptStop.event_type(), "transcript-stop");
+        assert_eq!(
+            Event::SynthesizeStart(SynthesizeStartData::default()).event_type(),
+            "synthesize-start"
+        );
+        assert_eq!(
+            Event::SynthesizeChunk(SynthesizeChunkData::new("hi")).event_type(),
+            "synthesize-chunk"
+        );
+        assert_eq!(Event::SynthesizeStop.event_type(), "synthesize-stop");
     }
 }
